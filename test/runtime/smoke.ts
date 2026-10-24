@@ -130,6 +130,60 @@ export async function smoke() {
       unexpectedNetwork === 0,
       'zero native network on imports and local operations',
     );
+    // The default transport is the platform's own fetch, called here once with the options the client
+    // sends. The target is a loopback port that nothing listens on, so no name is looked up and nothing
+    // leaves the machine (Chromium's content security policy stops the call before any network).
+    // Two checks do not depend on the network. The Request the client's call describes is built here
+    // first: a runtime that follows the specification refuses an invalid option value at that point,
+    // in Node and browsers too. And a runtime that does not implement an option (workerd refuses
+    // some outright) throws at once from the fetch itself, with a message that names the option; Node
+    // ignores members it does not know, so this second check is for the runtimes that do not.
+    const platform: { calls: number; refused?: unknown; error?: unknown } = {
+      calls: 0,
+    };
+    globalThis.fetch = async (input, init) => {
+      platform.calls++;
+      try {
+        new Request(input, init);
+      } catch (error) {
+        platform.refused = error;
+      }
+      try {
+        return await originalFetch(input, init);
+      } catch (error) {
+        platform.error = error;
+        throw error;
+      }
+    };
+    const native = await xivapi
+      .createXivapiClient({
+        baseUrl: 'https://127.0.0.1:9/api',
+        version,
+        schema,
+        timeoutMs: 3000,
+      })
+      .searchItems([model]);
+    check(platform.calls === 1, 'default transport called the platform fetch');
+    check(
+      platform.refused === undefined,
+      `the platform refused the default transport request (${String(platform.refused)})`,
+    );
+    check(
+      native.status === 'unavailable' &&
+        native.rows.length === 0 &&
+        native.issues.length === 1 &&
+        ['NETWORK_ERROR', 'TIMEOUT', 'UPSTREAM_UNAVAILABLE'].includes(
+          native.issues[0]?.code ?? '',
+        ),
+      `default transport reports an unreachable host (${native.status}, ${native.issues.map((issue) => issue.code).join(',')}, ${String(platform.error)})`,
+    );
+    check(
+      !(platform.error instanceof Error) ||
+        !/not implemented|not supported|unsupported|RequestInitializerDict/i.test(
+          platform.error.message,
+        ),
+      'the platform accepted the default transport request options',
+    );
     return {
       entries: 5,
       identity: 'Hyur',

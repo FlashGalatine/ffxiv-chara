@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 interface Metadata {
@@ -173,34 +174,48 @@ export async function assertVersionUnpublished(
   );
 }
 
-async function main(): Promise<void> {
-  const root = fileURLToPath(new URL('../', import.meta.url));
+export interface RunReleaseOptions {
+  /** Repository root: where packages/chara/package.json and .superpowers live. */
+  root: string;
+  /** The release step: preflight, prepare or verify. */
+  mode: string | undefined;
+  env: Record<string, string | undefined>;
+  request?: typeof fetch;
+  log?: (message: string) => void;
+}
+
+/** One release step, with every input it reads passed in so the three modes can be tested. */
+export async function runRelease({
+  root,
+  mode,
+  env,
+  request = fetch,
+  log = console.log,
+}: RunReleaseOptions): Promise<void> {
   const metadata: Metadata = JSON.parse(
     await readFile(join(root, 'packages/chara/package.json'), 'utf8'),
   );
   assert(
-    process.env.RELEASE_DRY_RUN === 'true' ||
-      process.env.RELEASE_DRY_RUN === 'false',
+    env.RELEASE_DRY_RUN === 'true' || env.RELEASE_DRY_RUN === 'false',
     'RELEASE_DRY_RUN must be true or false.',
   );
   const context: ReleaseContext = {
-    version: process.env.EXPECTED_VERSION ?? '',
-    tag: process.env.NPM_TAG ?? '',
-    dryRun: process.env.RELEASE_DRY_RUN === 'true',
-    releaseEnabled: process.env.NPM_RELEASE_ENABLED === 'true',
-    event: process.env.GITHUB_EVENT_NAME ?? '',
-    repository: process.env.GITHUB_REPOSITORY ?? '',
-    ref: process.env.GITHUB_REF ?? '',
-    commit: process.env.GITHUB_SHA ?? '',
+    version: env.EXPECTED_VERSION ?? '',
+    tag: env.NPM_TAG ?? '',
+    dryRun: env.RELEASE_DRY_RUN === 'true',
+    releaseEnabled: env.NPM_RELEASE_ENABLED === 'true',
+    event: env.GITHUB_EVENT_NAME ?? '',
+    repository: env.GITHUB_REPOSITORY ?? '',
+    ref: env.GITHUB_REF ?? '',
+    commit: env.GITHUB_SHA ?? '',
   };
   validateReleaseRequest(metadata, context);
-  const mode = process.argv[2];
   assert(
     mode === 'preflight' || mode === 'prepare' || mode === 'verify',
     'Unknown release mode.',
   );
   if (mode === 'preflight' || mode === 'verify')
-    await assertVersionUnpublished(metadata.version);
+    await assertVersionUnpublished(metadata.version, request);
   if (mode !== 'preflight') {
     const directory = join(
       root,
@@ -221,22 +236,43 @@ async function main(): Promise<void> {
         metadata,
         context,
         bytes,
-        process.env.RELEASE_INTEGRITY ?? '',
+        env.RELEASE_INTEGRITY ?? '',
       );
-    if (process.env.GITHUB_OUTPUT)
+    if (env.GITHUB_OUTPUT)
       await appendFile(
-        process.env.GITHUB_OUTPUT,
+        env.GITHUB_OUTPUT,
         `tarball=${tarball}\nintegrity=${manifest.integrity}\n`,
       );
-    console.log(`${mode}: ${manifest.filename} ${manifest.integrity}`);
+    log(`${mode}: ${manifest.filename} ${manifest.integrity}`);
   } else
-    console.log(
+    log(
       `Preflight passed: ${metadata.name}@${metadata.version}, tag ${context.tag}, dry run ${context.dryRun}.`,
     );
 }
 
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-)
-  await main();
+async function main(): Promise<void> {
+  await runRelease({
+    root: fileURLToPath(new URL('../', import.meta.url)),
+    mode: process.argv[2],
+    env: process.env,
+  });
+}
+
+/**
+ * Whether this module is the script Node was started with. Node realpaths a module's URL but not
+ * argv[1], so a script reached through a symlink or junction never compared equal and exited 0
+ * without doing anything; compare real paths instead.
+ */
+export function isEntryPoint(
+  moduleUrl: string,
+  argv1: string | undefined,
+): boolean {
+  if (!argv1) return false;
+  try {
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint(import.meta.url, process.argv[1])) await main();

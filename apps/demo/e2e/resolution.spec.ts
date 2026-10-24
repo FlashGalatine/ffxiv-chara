@@ -1,44 +1,5 @@
-import { expect, test } from '@playwright/test';
-import { load } from './helpers.js';
-
-test('clear discards a pending response and resets lookup permission', async ({
-  page,
-}) => {
-  let release: (() => void) | undefined;
-  await page.route('https://v2.xivapi.com/**', async (route) => {
-    if (route.request().url().includes('/version')) {
-      await route.fulfill({
-        json: { versions: [{ key: V, names: ['latest'] }] },
-      });
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await route
-      .fulfill({
-        json: {
-          version: V,
-          schema: S,
-          results: [item(1, 'STALE_AFTER_CLEAR')],
-        },
-      })
-      .catch(() => {});
-  });
-  await load(page, { Body: { ModelBase: 361, ModelVariant: 5 } });
-  await expect(page.getByTestId('identity')).toBeVisible();
-  await page
-    .getByRole('button', {
-      name: 'Resolve equipment and dye names',
-      exact: true,
-    })
-    .click();
-  await expect.poll(() => Boolean(release)).toBe(true);
-  await page.getByRole('button', { name: 'Clear file', exact: true }).click();
-  release?.();
-  await expect(page.getByTestId('identity')).toHaveCount(0);
-  await expect(page.locator('body')).not.toContainText('STALE_AFTER_CLEAR');
-});
+import { expect, test } from './fixtures.js';
+import { expectApproved, item, load, S, V } from './helpers.js';
 
 test('pages candidate lists in bounded reversible groups', async ({ page }) => {
   await page.route('https://v2.xivapi.com/**', (route) =>
@@ -66,34 +27,29 @@ test('pages candidate lists in bounded reversible groups', async ({ page }) => {
   await expect(page.locator('.candidate-list li')).toHaveCount(10);
   await page.getByRole('button', { name: 'Show next 10 candidates' }).click();
   await expect(page.locator('.candidate-list li')).toHaveCount(10);
+  await expect(page.locator('.candidate-list')).toHaveAttribute('start', '11');
   await expect(page.locator('.candidate-list li').first()).toContainText(
     'Candidate 11',
   );
   await page
     .getByRole('button', { name: 'Show previous 10 candidates' })
     .click();
-  await expect(page.locator('.candidate-list li').first()).toContainText(
-    'Candidate 1',
+  // "Candidate 11" contains "Candidate 1", so the first item is matched as a whole.
+  await expect(page.locator('.candidate-list li').first()).toHaveText(
+    /^Candidate 1(?!\d)/,
   );
+  await expect(page.locator('.candidate-list')).toHaveAttribute('start', '1');
+  await expect(
+    page.getByRole('button', { name: 'Show previous 10 candidates' }),
+  ).toHaveCount(0);
 });
 
-const V = '0123456789abcdef';
-const S = `exdschema@2:rev:${'a'.repeat(40)}`;
-const item = (id: number, name: string) => ({
-  sheet: 'Item',
-  row_id: id,
-  fields: {
-    'Name@lang(en)': name,
-    ModelMain: 328041,
-    ModelSub: 0,
-    EquipSlotCategory: { fields: { Body: 1 } },
-  },
-});
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
 });
 test('requires an explicit lookup, shows every candidate and sends only identifiers', async ({
   page,
+  traffic,
 }) => {
   const urls: string[] = [];
   await page.route('https://v2.xivapi.com/**', async (route) => {
@@ -130,6 +86,15 @@ test('requires an explicit lookup, shows every candidate and sends only identifi
   await expect(page.getByTestId('equipment')).toContainText(
     '<img src=x onerror=alert(1)>',
   );
+  await traffic.settle();
+  expect(traffic.toXivapi().length).toBeGreaterThan(2);
+  for (const request of traffic.toXivapi()) expectApproved(request);
+  expect(
+    traffic
+      .toXivapi()
+      .filter((r) => new URL(r.url).pathname === '/api/search')
+      .map((r) => new URL(r.url).searchParams.get('query')),
+  ).toEqual(['+((+EquipSlotCategory.Body=1 +ModelMain=328041))']);
   expect(urls.join(' ')).not.toMatch(/PRIVATE_|DyeId|HairTone|Nickname|Author/);
   expect(
     new URL(

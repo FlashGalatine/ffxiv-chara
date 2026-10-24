@@ -1,32 +1,5 @@
-import { expect, test } from '@playwright/test';
-import { load } from './helpers.js';
-
-test('terminates an overdue worker and preserves the previous valid inspection', async ({
-  page,
-}) => {
-  await load(page, { Tribe: 'Midlander' });
-  await expect(page.getByTestId('identity')).toContainText('Hyur');
-  await expect(
-    page.getByRole('button', {
-      name: 'Resolve equipment and dye names',
-      exact: true,
-    }),
-  ).toBeEnabled();
-  let release: (() => void) | undefined;
-  await page.route('**/assets/worker-*.js', async (route) => {
-    await new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await route.abort().catch(() => {});
-  });
-  await page.clock.install();
-  await load(page, { Tribe: 'Xaela' }, 'slow.chara');
-  await expect.poll(() => Boolean(release)).toBe(true);
-  await page.clock.runFor(5001);
-  await expect(page.getByRole('alert')).toContainText('PROCESSING_TIMEOUT');
-  await expect(page.getByTestId('identity')).toContainText('Hyur');
-  release?.();
-});
+import { expect, test } from './fixtures.js';
+import { load, resolveButton } from './helpers.js';
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
@@ -137,24 +110,54 @@ test('retains both dye IDs locally and preserves missing, null and invalid value
   }
   expect(external).toEqual([]);
 });
-test('renders hostile names and values literally and omits embedded image payloads', async ({
+test('renders hostile names and values literally, requests nothing and omits embedded image payloads', async ({
   page,
+  traffic,
 }) => {
-  await load(page, {
-    Nickname: '<img src="https://evil.invalid/" onerror="alert(1)">',
-    HairTone: 0,
-    Base64Image: 'PRIVATE_IMAGE_CANARY',
-    Note: '<script>alert(1)</script>',
-  });
+  // The fixture also fails the test on any dialog, popup, download, page error or CSP violation.
+  const hostileName = '<img src=x onerror=alert(6)>.chara';
+  await load(
+    page,
+    {
+      Nickname: '<img src="https://evil.invalid/" onerror="alert(1)">',
+      HairTone: 0,
+      Base64Image: 'PRIVATE_IMAGE_CANARY',
+      Note: '<script>alert(1)</script>',
+      '<img src=x onerror=alert(2)>': 'hostile key',
+      '"><svg onload=alert(3)>': { '<b>nested</b>': 'javascript:alert(4)' },
+      Link: 'javascript:alert(5)',
+      Tracker: 'https://evil.invalid/tracker.png',
+    },
+    hostileName,
+  );
   await expect(page.getByTestId('identity')).toContainText('<img src=');
+  await expect(page.locator('.filename')).toHaveText(hostileName);
   await page.getByText('Stored values', { exact: true }).click();
   await expect(page.getByTestId('stored-values')).toContainText(
     '<script>alert(1)</script>',
   );
-  expect(await page.locator('img[src*="evil"]').count()).toBe(0);
+  await expect(page.getByTestId('stored-values')).toContainText(
+    '<img src=x onerror=alert(2)>',
+  );
+  await page.getByText('"><svg onload=alert(3)> — Object').click();
+  await expect(page.getByTestId('stored-values')).toContainText(
+    'javascript:alert(4)',
+  );
+  await expect(page.getByTestId('swatches')).not.toContainText('Loading');
+  expect(
+    await page
+      .locator('img[src*="evil"], svg[onload], script:not([src])')
+      .count(),
+  ).toBe(0);
   expect(await page.locator('body').textContent()).not.toContain(
     'PRIVATE_IMAGE_CANARY',
   );
+  await traffic.settle();
+  expect(traffic.offOrigin()).toEqual([]);
+  expect(traffic.requests.filter((r) => /evil|alert/.test(r.url))).toEqual([]);
+  expect(traffic.navigations).toEqual([`${traffic.appOrigin}/`]);
+  expect(traffic.dialogs).toEqual([]);
+  expect(traffic.pageErrors).toEqual([]);
 });
 test('preserves a valid inspection on rejected replacements and checks extension and size', async ({
   page,
@@ -169,6 +172,8 @@ test('preserves a valid inspection on rejected replacements and checks extension
     await load(page, content, String(name));
     await expect(page.getByRole('alert')).toContainText(String(reason));
     await expect(page.getByTestId('identity')).toContainText('Hyur');
+    // The file that is kept can be looked up again, whichever way the replacement was refused.
+    await expect(resolveButton(page)).toBeEnabled();
   }
 });
 test('provides keyboard file selection and clear releases local state', async ({
@@ -178,6 +183,9 @@ test('provides keyboard file selection and clear releases local state', async ({
     .getByRole('button', { name: 'Choose .chara file', exact: true })
     .focus();
   const chooser = page.waitForEvent('filechooser');
+  // A key press is immediate, unlike a click: make sure the browser is intercepting the chooser
+  // before the press opens it, or the native dialog opens and no event ever arrives.
+  await page.evaluate(() => undefined);
   await page.keyboard.press('Enter');
   await (await chooser).setFiles({
     name: 'keyboard.chara',
@@ -226,6 +234,13 @@ test('reports failed appearance processing without a permanent loading state or 
   await expect(page.getByRole('alert')).not.toContainText('previous valid');
   await expect(page.getByTestId('swatch-hair')).toContainText('Unavailable');
   await expect(page.getByTestId('swatches')).not.toContainText('Loading');
+  // The file was inspected, so a lookup can still be started.
+  await expect(resolveButton(page)).toBeEnabled();
+});
+test('shows only the first 256 characters of a file name', async ({ page }) => {
+  await load(page, { Tribe: 'Midlander' }, `${'n'.repeat(300)}.chara`);
+  await expect(page.getByTestId('identity')).toContainText('Hyur');
+  await expect(page.locator('.filename')).toHaveText('n'.repeat(256));
 });
 test('bounds the visible character nickname without changing its admitted value', async ({
   page,

@@ -10,13 +10,13 @@ Use XIVCharaKit for bounded reading, typed inspection and appearance interpretat
 
 The library's richer partial-file and unresolved-state behavior is not a drop-in replacement for the old host model. The plan records intentional differences, including inactive lip alpha and missing shader evidence, and gates existing producer aliases before consumer adoption. Future eye/hair/skin free colors require actual game/producer format evidence rather than assuming current extended fields will represent them.
 
-The legacy `Helion` → `Helions` compatibility fix is implemented and regression-tested in the beta.3 candidate. Published beta.2 still lacks it; consumer adoption requires a published and verified version containing the fix. The integration plan retains this release gate.
+The legacy `Helion` → `Helions` compatibility fix is implemented and regression-tested in `0.1.0-beta.3`, published on 2026-10-22. Beta.2 lacks it; consumer adoption still requires verifying the published beta.3 artifact. The integration plan retains this release gate.
 
 ## Try a local artifact
 
-`xivcharakit@0.1.0-beta.2` is published; its registry integrity and trusted-publisher provenance were verified on 2026-10-22. The integration target is exactly `xivcharakit@0.1.0-beta.3` once it is published and verified, including the alias fix. Do not install a moving dist-tag for a reproducible migration. XIV Dye Tools' existing 24-hour release-age policy still applies.
+`xivcharakit@0.1.0-beta.2` is published; its registry integrity and trusted-publisher provenance were verified on 2026-10-22. The integration target is exactly `xivcharakit@0.1.0-beta.3` (published 2026-10-22) once its registry artifact and provenance are verified, including the alias fix. Do not install a moving dist-tag for a reproducible migration. XIV Dye Tools' existing 24-hour release-age policy still applies. Beta.4 (prepared, not published) moves the appearance policy to `1.1.0`: it reads the lip-color bit of `Mouth` and the mirror bit of `FacePaint`, so on the committed real exports it reports the lip as inactive (`lipDisabled`) where beta.3 reported a palette lip for three of the four (both Anamnesis files and the Ktisis file). A local beta.4 tarball therefore gives different appearance results from the pinned beta.3; whether the target moves to beta.4 once it is published, verified and aged is the maintainer's decision.
 
-For local development, run `pnpm test:package` to build and validate `.superpowers/package-smoke/xivcharakit-0.1.0-beta.3.tgz`. A fresh local consumer can install that tarball with `pnpm add <absolute-tarball-path>`. The artifact name follows the committed library version; a local tarball is not a replacement for reviewing the registry dependency used in the target's release.
+For local development, run `pnpm test:package` to build and validate `.superpowers/package-smoke/xivcharakit-0.1.0-beta.4.tgz`. A fresh local consumer can install that tarball with `pnpm add <absolute-tarball-path>`. The artifact name follows the committed library version; a local tarball is not a replacement for reviewing the registry dependency used in the target's release.
 
 ```ts
 import { readChara, inspectChara } from 'xivcharakit';

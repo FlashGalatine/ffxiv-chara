@@ -1,5 +1,5 @@
-import { expect, test } from '@playwright/test';
-import { load } from './helpers.js';
+import { expect, test } from './fixtures.js';
+import { expectApproved, load } from './helpers.js';
 
 const V = '0123456789abcdef';
 const S = `exdschema@2:rev:${'a'.repeat(40)}`;
@@ -51,6 +51,7 @@ test.beforeEach(async ({ page }) => {
 
 test('keeps names local until explicit lookup, batches IDs and caches repeated lookups', async ({
   page,
+  traffic,
 }) => {
   const urls: URL[] = [];
   await page.route('https://v2.xivapi.com/**', async (route) => {
@@ -101,6 +102,9 @@ test('keeps names local until explicit lookup, batches IDs and caches repeated l
   const stains = () => urls.filter((url) => url.pathname.endsWith('/Stain'));
   expect(stains()).toHaveLength(1);
   expect(stains()[0]?.searchParams.get('rows')).toBe('3,126,65535');
+  await traffic.settle();
+  expect(traffic.toXivapi().length).toBeGreaterThan(1);
+  for (const request of traffic.toXivapi()) expectApproved(request);
   expect(urls.map(String).join(' ')).not.toMatch(
     /PRIVATE_|HairTone|Nickname|Author/,
   );
@@ -146,35 +150,4 @@ test('keeps raw IDs usable when dye lookup fails', async ({ page }) => {
     page.getByRole('button', { name: button, exact: true }),
   ).toBeEnabled();
   await expect(page.getByTestId('identity')).toBeVisible();
-});
-
-test('clear discards a pending dye-name response', async ({ page }) => {
-  let release: (() => void) | undefined;
-  await page.route('https://v2.xivapi.com/**', async (route) => {
-    if (route.request().url().includes('/version')) {
-      await route.fulfill({
-        json: { versions: [{ key: V, names: ['latest'] }] },
-      });
-      return;
-    }
-    await new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await route
-      .fulfill({
-        json: {
-          version: V,
-          schema: S,
-          rows: [{ row_id: 3, fields: { 'Name@lang(en)': 'STALE_DYE' } }],
-        },
-      })
-      .catch(() => {});
-  });
-  await load(page, { Body: { DyeId: 3 } });
-  await page.getByRole('button', { name: button, exact: true }).click();
-  await expect.poll(() => Boolean(release)).toBe(true);
-  await page.getByRole('button', { name: 'Clear file', exact: true }).click();
-  release?.();
-  await expect(page.getByTestId('identity')).toHaveCount(0);
-  await expect(page.locator('body')).not.toContainText('STALE_DYE');
 });

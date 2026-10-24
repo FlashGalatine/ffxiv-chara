@@ -1,29 +1,25 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import {
   createDefaultPaletteProvider,
   PALETTE_METADATA,
 } from '../packages/chara/src/palettes/index.js';
+import {
+  assertArtifactSet,
+  countColors,
+  sha256,
+  totalColors,
+} from './palette-metadata.js';
 
 const root = new URL('../packages/chara/src/palettes/', import.meta.url);
-const count = (value: unknown): number =>
-  Array.isArray(value)
-    ? value.length
-    : Object.values(value as object).reduce<number>(
-        (total, child) => total + count(child),
-        0,
-      );
+assertArtifactSet(PALETTE_METADATA.artifacts);
 for (const artifact of PALETTE_METADATA.artifacts) {
   assert(/^data\/(creator|shader)-(shared|race)\.json$/.test(artifact.file));
   const data: unknown = JSON.parse(
     await readFile(new URL(artifact.file, root), 'utf8'),
   );
-  assert.equal(
-    createHash('sha256').update(JSON.stringify(data)).digest('hex'),
-    artifact.sha256,
-  );
-  assert.equal(count(data), artifact.colorCount);
+  assert.equal(sha256(JSON.stringify(data)), artifact.sha256);
+  assert.equal(countColors(data), artifact.colorCount);
 }
 const provider = createDefaultPaletteProvider();
 for (const table of ['creator', 'shader'] as const) {
@@ -69,5 +65,5 @@ assert.equal(
   '#E5D2AC',
 );
 console.log(
-  `Verified ${PALETTE_METADATA.artifacts.length} table hashes and 26,208 palette colors; dataset ${PALETTE_METADATA.datasetVersion}, game revision ${PALETTE_METADATA.gameVersion ?? 'unknown'}.`,
+  `Verified ${PALETTE_METADATA.artifacts.length} table hashes and ${totalColors(PALETTE_METADATA.artifacts).toLocaleString('en-US')} palette colors; dataset ${PALETTE_METADATA.datasetVersion}, game revision ${PALETTE_METADATA.gameVersion ?? 'unknown'}.`,
 );

@@ -13,6 +13,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertPublicArtifact } from './package-policy.js';
 import { getPackageArtifactName } from './release.js';
+import { runTool } from './run-tool.js';
 import { runRuntimeChecks } from './runtime-runner.js';
 
 const root = new URL('../', import.meta.url);
@@ -158,14 +159,14 @@ const dyes: DyeNameResolver = createDyeNameResolver();
 await dyes.resolve([]);
 `,
   );
-  execFileSync(
+  runTool(
     process.execPath,
     [
       fileURLToPath(new URL('node_modules/typescript/bin/tsc', root)),
       '--project',
       'tsconfig.json',
     ],
-    { cwd: consumer, stdio: 'pipe' },
+    { cwd: consumer },
   );
   await writeFile(
     `${consumer}/worker.mjs`,

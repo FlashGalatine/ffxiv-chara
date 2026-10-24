@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDyeNameResolver } from '../src/dyes/index.js';
-import { createMemoryCache } from '../src/xivapi/index.js';
+import { createMemoryCache, createXivapiClient } from '../src/xivapi/index.js';
 
 const V = '0123456789abcdef';
 const S = `exdschema@2:rev:${'a'.repeat(40)}`;
@@ -157,7 +157,7 @@ describe('cached optional dye-name lookup', () => {
     await resolver.resolve([3]);
     expect(fetch).toHaveBeenCalledTimes(2);
   });
-  it('retains blank rows and distinguishes an empty successful response from failure', async () => {
+  it('retains blank rows and accepts a non-conforming 200 that leaves out a requested row', async () => {
     const resolver = createDyeNameResolver({
       version: V,
       schema: S,
@@ -351,5 +351,324 @@ describe('cached optional dye-name lookup', () => {
     expect((await first).status).toBe('cancelled');
     finish(response([row(3)]));
     expect((await second).status).toBe('complete');
+  });
+});
+
+// The live API answers a row list that names a missing row with HTTP 404 and the first
+// missing row (checked 2026-10-23); it never returns a 200 that silently omits the row.
+const missingRow = (sheet: string, id: number) =>
+  new Response(
+    JSON.stringify({
+      code: 404,
+      message: `not found: the Excel row ${sheet}/${id}:0 could not be found`,
+    }),
+    { status: 404 },
+  );
+const stainApi =
+  (existing: readonly number[], urls: URL[] = []): typeof globalThis.fetch =>
+  async (input) => {
+    const url = new URL(String(input));
+    urls.push(url);
+    const ids = (url.searchParams.get('rows') ?? '').split(',').map(Number);
+    const gap = ids.find((id) => !existing.includes(id));
+    return gap === undefined
+      ? response(ids.map((id) => row(id, `Dye ${id}`)))
+      : missingRow('Stain', gap);
+  };
+const dyes = (fetch: typeof globalThis.fetch, extra = {}) =>
+  createDyeNameResolver({
+    fetch,
+    version: V,
+    schema: S,
+    languages: ['en'],
+    ...extra,
+  });
+
+describe('rows that XIVAPI reports as missing', () => {
+  it('drops each missing Stain row and still names the others', async () => {
+    const urls: URL[] = [];
+    const result = await dyes(stainApi([0, 3], urls)).resolve([201, 3, 0, 200]);
+    expect(urls.map((url) => url.searchParams.get('rows'))).toEqual([
+      '0,3,200,201',
+      '0,3,201',
+      '0,3',
+    ]);
+    expect(result).toMatchObject({
+      status: 'complete',
+      version: V,
+      schema: S,
+      issues: [],
+    });
+    expect(result.rows.map((r) => r.rowId)).toEqual([0, 3]);
+  });
+  it('reports a request whose rows are all missing as complete and empty, and caches it', async () => {
+    const urls: URL[] = [];
+    const resolver = dyes(stainApi([0], urls));
+    expect(await resolver.resolve([200])).toMatchObject({
+      status: 'complete',
+      rows: [],
+      version: V,
+      schema: S,
+    });
+    await resolver.resolve([200]);
+    expect(urls).toHaveLength(1);
+  });
+  it.each([
+    [
+      'a missing sheet',
+      'not found: the Excel sheet "Stain" could not be found',
+    ],
+    [
+      'a different sheet',
+      'not found: the Excel row Item/3:0 could not be found',
+    ],
+    [
+      'a row that was not requested',
+      'not found: the Excel row Stain/77:0 could not be found',
+    ],
+    ['an unrecognised message', 'something else entirely'],
+    [
+      'a row id with leading zeros',
+      'not found: the Excel row Stain/003:0 could not be found',
+    ],
+    [
+      'a non-zero subrow',
+      'not found: the Excel row Stain/3:7 could not be found',
+    ],
+  ])('still fails closed on a 404 naming %s', async (_name, message) => {
+    const fetch = vi
+      .fn<typeof globalThis.fetch>()
+      .mockImplementation(
+        async () =>
+          new Response(JSON.stringify({ code: 404, message }), { status: 404 }),
+      );
+    const result = await dyes(fetch).resolve([3]);
+    expect(result.status).toBe('unavailable');
+    expect(result.issues.map((issue) => issue.code)).toContain(
+      'UPSTREAM_UNAVAILABLE',
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+  const matching = (extra = {}) =>
+    JSON.stringify({
+      code: 404,
+      message: 'not found: the Excel row Stain/3:0 could not be found',
+      ...extra,
+    });
+  it.each([
+    ['not JSON', 'not json at all'],
+    [
+      'over 4 KiB although the message matches',
+      matching({ pad: 'x'.repeat(5000) }),
+    ],
+    ['carrying another code', matching({ code: 500 })],
+  ])('does not trust a 404 body that is %s', async (_name, text) => {
+    const result = await dyes(
+      async () => new Response(text, { status: 404 }),
+    ).resolve([3]);
+    expect(result.status).toBe('unavailable');
+    expect(result.issues.map((issue) => issue.code)).toEqual([
+      'UPSTREAM_UNAVAILABLE',
+    ]);
+  });
+  it.each([400, 410, 500])(
+    'does not take a status-%i answer for a missing row',
+    async (status) => {
+      const fetch = vi.fn<typeof globalThis.fetch>(
+        async () => new Response(matching(), { status }),
+      );
+      const result = await dyes(fetch).resolve([3]);
+      expect(result.status).toBe('unavailable');
+      expect(result.issues.map((issue) => issue.code)).toContain(
+        'UPSTREAM_UNAVAILABLE',
+      );
+      expect(fetch).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('leaves the schema null when every row is missing and the schema is not pinned', async () => {
+    const paths: string[] = [];
+    const resolver = createDyeNameResolver({
+      languages: ['en'],
+      fetch: async (input) => {
+        const url = new URL(String(input));
+        paths.push(url.pathname);
+        return url.pathname.endsWith('/version')
+          ? new Response(
+              JSON.stringify({ versions: [{ key: V, names: ['latest'] }] }),
+            )
+          : missingRow('Stain', 200);
+      },
+    });
+    expect(await resolver.resolve([200])).toMatchObject({
+      status: 'complete',
+      rows: [],
+      version: V,
+      schema: null,
+    });
+    // Without both identities the empty answer is not cached, so asking again asks again.
+    await resolver.resolve([200]);
+    expect(paths).toEqual([
+      '/api/version',
+      '/api/sheet/Stain',
+      '/api/sheet/Stain',
+    ]);
+  });
+  it('does not drop rows while the version alias is unresolved', async () => {
+    // A 404 names no version, so with 'latest' unresolved a later 200 could describe another one.
+    const urls: URL[] = [];
+    const fetch: typeof globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      urls.push(url);
+      return url.pathname.endsWith('/version')
+        ? new Response('{}', { status: 500 })
+        : missingRow('Stain', 200);
+    };
+    const result = await createDyeNameResolver({
+      fetch,
+      schema: S,
+      languages: ['en'],
+    }).resolve([2, 200]);
+    expect(result.status).toBe('unavailable');
+    expect(result.issues.map((issue) => issue.code)).toContain(
+      'UPSTREAM_UNAVAILABLE',
+    );
+    expect(urls.map((url) => url.pathname)).toEqual([
+      '/api/version',
+      '/api/sheet/Stain',
+    ]);
+  });
+  it('flags a dropped row that comes back in the later answer', async () => {
+    let calls = 0;
+    const fetch: typeof globalThis.fetch = async () =>
+      ++calls === 1
+        ? missingRow('Stain', 200)
+        : response([row(2), row(3), row(200)]);
+    const result = await dyes(fetch).resolve([2, 3, 200]);
+    expect(calls).toBe(2);
+    expect(result.status).toBe('partial');
+    expect(result.rows.map((r) => r.rowId)).toEqual([2, 3]);
+    expect(result.issues.map((issue) => issue.code)).toContain('INVALID_ROW');
+  });
+  it('stays inside the request budget when every row is missing', async () => {
+    const urls: URL[] = [];
+    const result = await dyes(stainApi([], urls)).resolve(
+      Array.from({ length: 64 }, (_, i) => 100 + i),
+    );
+    expect(urls).toHaveLength(40);
+    expect(result.status).toBe('unavailable');
+    expect(result.issues.map((issue) => issue.code)).toContain('REQUEST_LIMIT');
+  });
+});
+
+describe('host option objects that are not plain literals', () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => {
+        throw new Error('unexpected global fetch');
+      }),
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  it('reads an inherited base URL and rejects an inherited invalid maxPages', async () => {
+    const urls: URL[] = [];
+    const fetch: typeof globalThis.fetch = async (input) => {
+      urls.push(new URL(String(input)));
+      return response([row(3)]);
+    };
+    await createDyeNameResolver(
+      Object.create({
+        fetch,
+        baseUrl: 'https://example.test/api',
+        version: V,
+        schema: S,
+        languages: ['en'],
+      }),
+    ).resolve([3]);
+    expect(urls.map((url) => url.origin)).toEqual(['https://example.test']);
+    expect(() =>
+      createDyeNameResolver(Object.create({ maxPages: 0 })),
+    ).toThrow();
+  });
+  const make = () => {
+    const urls: URL[] = [];
+    const fetch: typeof globalThis.fetch = async (input) => {
+      urls.push(new URL(String(input)));
+      return response([row(3)]);
+    };
+    return { urls, fetch };
+  };
+  it.each([
+    [
+      'a class with getters',
+      (fetch: typeof globalThis.fetch) =>
+        new (class {
+          get fetch() {
+            return fetch;
+          }
+          get version() {
+            return V;
+          }
+          get schema() {
+            return S;
+          }
+          get languages() {
+            return ['en' as const];
+          }
+        })(),
+    ],
+    [
+      'inherited options',
+      (fetch: typeof globalThis.fetch) =>
+        Object.create({ fetch, version: V, schema: S, languages: ['en'] }),
+    ],
+    [
+      'non-enumerable options',
+      (fetch: typeof globalThis.fetch) =>
+        Object.defineProperties(
+          {},
+          {
+            fetch: { value: fetch },
+            version: { value: V },
+            schema: { value: S },
+            languages: { value: ['en'] },
+          },
+        ),
+    ],
+  ])('reads %s the way the client does', async (_name, options) => {
+    const { urls, fetch } = make();
+    const config = options(fetch);
+    const viaDyes = await createDyeNameResolver(config).resolve([3]);
+    const viaClient = await createXivapiClient(config).getStains([3]);
+    expect(viaDyes).toMatchObject({
+      status: 'complete',
+      version: V,
+      schema: S,
+    });
+    expect(viaClient.rows).toEqual(viaDyes.rows);
+    expect(urls).toHaveLength(2);
+    for (const url of urls) {
+      expect(url.searchParams.get('version')).toBe(V);
+      expect(url.searchParams.get('fields')).toBe('Name@lang(en)');
+    }
+  });
+  it('rejects an option getter that throws with the same error as the client', () => {
+    const config = Object.defineProperty({}, 'baseUrl', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    expect(() => createDyeNameResolver(config)).toThrow(
+      expect.objectContaining({ code: 'INVALID_OPTIONS' }),
+    );
+    expect(() => createXivapiClient(config)).toThrow(
+      expect.objectContaining({ code: 'INVALID_OPTIONS' }),
+    );
+  });
+  it('still rejects a null cache and a non-object', () => {
+    expect(() => createDyeNameResolver({ cache: null } as never)).toThrow();
+    expect(() => createDyeNameResolver(null as never)).toThrow();
   });
 });

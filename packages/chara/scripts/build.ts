@@ -9,6 +9,8 @@ if (dirname(output) !== resolve(packageRoot))
   throw new Error('Unexpected build output directory.');
 await rm(output, { recursive: true, force: true });
 const result = await build({
+  // Resolve entry points and the output from the package, not from wherever this was started.
+  absWorkingDir: packageRoot,
   entryPoints: {
     index: 'src/index.ts',
     palettes: 'src/palettes/index.ts',
@@ -16,7 +18,7 @@ const result = await build({
     dyes: 'src/dyes/index.ts',
     xivapi: 'src/xivapi/index.ts',
   },
-  outdir: 'dist',
+  outdir: output,
   bundle: true,
   format: 'esm',
   platform: 'neutral',

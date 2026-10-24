@@ -72,6 +72,8 @@ $env:DEMO_BASE_URL = 'https://charakit.projectgalatine.com'
 pnpm --filter @xivcharakit/demo exec playwright test --config playwright.cloudflare.config.ts hosting/hosting.spec.ts
 ```
 
+The spec compares the served `index.html` with the local `apps/demo/dist/index.html` and takes the hashed worker file name from the local `apps/demo/dist/assets/`. Check out the commit that is deployed and run `pnpm build` first: a local build from a different commit fails with an `index.html` body mismatch or a 404 for the worker asset.
+
 For an ordinary, low-volume live XIVAPI check using only the public synthetic example:
 
 ```powershell
@@ -87,7 +89,7 @@ Optionally set `DEMO_QA_DIR` to an existing ignored directory to save the live r
 
 The initial deployment created the custom-domain binding and its managed certificate in the existing active `projectgalatine.com` zone. The verified final Cloudflare version is `9d560c34-7991-4571-bfb3-3c34f2bdccff`.
 
-That deployment used the beta.2 library implementation before the `Helion` fix. Its artifact and acceptance results below are a historical record; the beta.3 candidate needs a separate authorized deployment and deployed-origin acceptance check.
+That deployment used the beta.2 library implementation before the `Helion` fix. Its artifact and acceptance results below are a historical record; beta.3, published to npm on 2026-10-22, needs a separate authorized deployment and deployed-origin acceptance check.
 
 All 19 publicly served files (304,064 bytes) matched the reviewed local build exactly by byte length and SHA-256. The generated `_headers` configuration remained inaccessible. Deployed-origin checks passed for HTTPS, security headers, JavaScript MIME types, complete legal files and missing/private paths. The opt-in Chromium check passed local inspection, explicit equipment/facewear lookup and two decoded icons using the public synthetic Ktisis example. Its five XIVAPI requests were GETs with no body, credentials or referrer, and all returned HTTP 200 with CORS enabled. The example's dye IDs are zero, so that live check did not exercise nonzero Stain-name resolution.
 

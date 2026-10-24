@@ -7,5 +7,5 @@
     "types": ["vite/client", "node"],
     "noEmit": true
   },
-  "include": ["src", "e2e", "hosting", "*.ts"]
+  "include": ["src", "e2e", "hosting", "test", "*.ts"]
 }

@@ -6,7 +6,12 @@ import type {
   EquipmentSlot,
 } from '../types.js';
 import { createTransport } from './client.js';
-import { lookupsFrom, type SlotLookup, XivapiInputError } from './query.js';
+import {
+  lookupsFrom,
+  type SlotLookup,
+  signalFrom,
+  XivapiInputError,
+} from './query.js';
 import type {
   EquipmentCandidate,
   EquipmentResolution,
@@ -25,8 +30,10 @@ function capture(input: EquipmentResolveInput): {
 } {
   if (typeof input !== 'object' || input === null || Array.isArray(input))
     throw new XivapiInputError('INVALID_LOOKUP');
+  // Read each caller property once: a getter must not be able to change a value after it is checked.
+  const glassesId = input.glassesId;
   const lookups = lookupsFrom(input.models);
-  if (input.glassesId !== undefined && !isUint(input.glassesId))
+  if (glassesId !== undefined && !isUint(glassesId))
     throw new XivapiInputError('INVALID_LOOKUP');
   // Reconstruct from admitted packed identities; no source object/extra property survives.
   const models = lookups.map(({ slot, key }: SlotLookup): EquipmentModel => {
@@ -44,9 +51,7 @@ function capture(input: EquipmentResolveInput): {
           variant: Number((packed >> 16n) & 65535n),
         };
   });
-  return input.glassesId === undefined
-    ? { models }
-    : { models, glassesId: input.glassesId };
+  return glassesId === undefined ? { models } : { models, glassesId };
 }
 
 function status(lookup: LookupResult, count: number): ResolutionStatus {
@@ -92,7 +97,8 @@ function matchItems(
     let matches = index.get(`${model.slot}:${key}`) ?? [];
     let viaMainHand = false;
     let incompleteContext = false;
-    if (model.slot === 'OffHand') {
+    // Key "0" is the all-zero "nothing equipped" model, never a shield or off-hand to pair.
+    if (model.slot === 'OffHand' && key !== '0') {
       const paired = mainRows.filter(
         (row) => key === mainKey || row.modelSub === key,
       );
@@ -133,15 +139,7 @@ export function createXivapiResolver(
   return {
     async resolve(input, requestOptions = {}) {
       const request = capture(input);
-      if (
-        typeof requestOptions !== 'object' ||
-        requestOptions === null ||
-        Array.isArray(requestOptions) ||
-        (requestOptions.signal !== undefined &&
-          !(requestOptions.signal instanceof AbortSignal))
-      )
-        throw new XivapiInputError('INVALID_LOOKUP');
-      const signal = requestOptions.signal;
+      const signal = signalFrom(requestOptions);
       const { items, facewear } = await client.resolveRows(
         request.models,
         request.glassesId,

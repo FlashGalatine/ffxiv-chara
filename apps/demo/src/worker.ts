@@ -1,18 +1,23 @@
 import { CharaInputError, inspectChara, readChara } from 'xivcharakit';
-import type { WorkerReply } from './types.js';
+import { projectAppearance } from './project.js';
+import type { WorkerReply, WorkerRequest } from './types.js';
 
 const context = globalThis as unknown as {
-  onmessage: (event: MessageEvent<File>) => void;
+  onmessage: (event: MessageEvent<WorkerRequest>) => void;
   postMessage(value: WorkerReply): void;
 };
 context.onmessage = async (event) => {
+  const request = event.data;
   let inspected = false;
   try {
-    const inspection = inspectChara(
-      readChara(new Uint8Array(await event.data.arrayBuffer())),
-    );
+    // A resumed job already has its inspection on the page, so only the colors are resolved.
+    const inspection =
+      request instanceof Blob
+        ? inspectChara(readChara(new Uint8Array(await request.arrayBuffer())))
+        : request.inspection;
     inspected = true;
-    context.postMessage({ type: 'inspection', inspection });
+    if (request instanceof Blob)
+      context.postMessage({ type: 'inspection', inspection });
     const [appearance, palettes] = await Promise.all([
       import('xivcharakit/appearance'),
       import('xivcharakit/palettes'),
@@ -20,7 +25,10 @@ context.onmessage = async (event) => {
     const result = await appearance.resolveAppearance(inspection, {
       palettes: palettes.createDefaultPaletteProvider(),
     });
-    context.postMessage({ type: 'appearance', appearance: result });
+    context.postMessage({
+      type: 'appearance',
+      appearance: projectAppearance(result),
+    });
   } catch (error) {
     context.postMessage({
       type: 'rejected',

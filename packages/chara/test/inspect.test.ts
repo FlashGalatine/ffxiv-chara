@@ -10,6 +10,124 @@ import {
 const inspect = (fields: object) =>
   inspectChara(readChara(JSON.stringify(fields)));
 
+describe('unsupported versus invalid labels', () => {
+  // Every field that can be unsupported is a byte in the producers' files: a string, or an
+  // integer 0-255, that is not a known value is unsupported; a wider integer cannot be a
+  // producer value, so it is invalid. Both are warnings and the raw value is kept.
+  it.each([
+    ['Race', 255, 'unsupported'],
+    ['Race', 256, 'invalid'],
+    ['Race', 300, 'invalid'],
+    ['Race', 65536, 'invalid'],
+    ['Tribe', 200, 'unsupported'],
+    ['Tribe', 300, 'invalid'],
+    ['Gender', 2, 'unsupported'],
+    ['Gender', 300, 'invalid'],
+    ['Age', 5, 'unsupported'],
+    ['Age', 256, 'invalid'],
+    ['FacialFeatures', 300, 'invalid'],
+    ['Race', 'FutureRace', 'unsupported'],
+    ['Age', 'Elderly', 'unsupported'],
+    ['FacialFeatures', 'Unknown', 'unsupported'],
+    ['Race', 1.5, 'invalid'],
+    ['Race', -1, 'invalid'],
+  ] as const)('labels %s %j as %s', (key, value, state) => {
+    const result = inspect({ [key]: value });
+    const field =
+      key === 'FacialFeatures'
+        ? result.appearance.FacialFeatures
+        : result.identity[
+            key.toLowerCase() as 'race' | 'tribe' | 'gender' | 'age'
+          ];
+    expect(field).toMatchObject({ state, raw: value });
+    expect(result.issues.map((issue) => issue.code)).toContain(
+      state === 'unsupported' ? 'UNSUPPORTED_VALUE' : 'INVALID_FIELD',
+    );
+  });
+});
+
+describe('truncated diagnostics', () => {
+  const crowded = (extra: object = {}) => ({
+    Race: 'Hyur',
+    ...Object.fromEntries(
+      Array.from({ length: 12 }, (_, i) => [`Unknown${i}`, i]),
+    ),
+    ...extra,
+  });
+  it('keeps the reader truncation marker as the single final entry', () => {
+    const document = readChara(JSON.stringify(crowded({ HairTone: 'x' })), {
+      maxIssues: 4,
+    });
+    expect(document.issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    const issues = inspectChara(document).issues;
+    expect(issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    expect(
+      issues.filter((issue) => issue.code === 'ISSUES_TRUNCATED'),
+    ).toHaveLength(1);
+    expect(issues.map((issue) => issue.code)).toContain('INVALID_FIELD');
+  });
+  it('keeps one final marker when inspection fills the list exactly to its cap', () => {
+    // 63 copied reader diagnostics plus exactly one of the inspection's own make 64 entries without
+    // overflowing, so only an explicit final marker can keep the reader's truncation visible.
+    const fields: Record<string, unknown> = { Race: 'Hyur', HairTone: 'x' };
+    for (let i = 0; i < 80; i++) fields[`Unknown${i}`] = i;
+    const document = readChara(JSON.stringify(fields));
+    expect(document.issues).toHaveLength(64);
+    expect(document.issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    const issues = inspectChara(document).issues;
+    expect(issues).toHaveLength(64);
+    expect(issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    expect(
+      issues.filter((issue) => issue.code === 'INVALID_FIELD'),
+    ).toHaveLength(0); // replaced by the marker
+    expect(
+      issues.filter((issue) => issue.code === 'ISSUES_TRUNCATED'),
+    ).toHaveLength(1);
+  });
+  it('keeps the marker last when the only inspection diagnostic is a bad ModelType', () => {
+    const document = readChara(JSON.stringify(crowded({ ModelType: 'x' })), {
+      maxIssues: 4,
+    });
+    const issues = inspectChara(document).issues;
+    expect(issues.map((issue) => issue.code)).toContain('INVALID_FIELD');
+    expect(issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    expect(
+      issues.filter((issue) => issue.code === 'ISSUES_TRUNCATED'),
+    ).toHaveLength(1);
+  });
+  it('does not invent a marker when the reader did not truncate', () => {
+    const issues = inspectChara(
+      readChara(JSON.stringify({ Race: 'Hyur', HairTone: 'x' })),
+    ).issues;
+    expect(issues.map((issue) => issue.code)).not.toContain('ISSUES_TRUNCATED');
+  });
+  it('still ends with exactly one marker when inspection overflows its own cap too', () => {
+    const fields: Record<string, unknown> = { Race: 'Hyur' };
+    for (let i = 0; i < 90; i++) fields[`Hair${i}`] = i;
+    for (const key of [
+      'HairTone',
+      'Skintone',
+      'Height',
+      'Head',
+      'Hair',
+      'Eyebrows',
+      'Eyes',
+      'Nose',
+      'Jaw',
+      'Mouth',
+    ])
+      fields[key] = 'x';
+    const issues = inspectChara(
+      readChara(JSON.stringify(fields), { maxIssues: 3 }),
+    ).issues;
+    expect(issues.at(-1)?.code).toBe('ISSUES_TRUNCATED');
+    expect(
+      issues.filter((issue) => issue.code === 'ISSUES_TRUNCATED'),
+    ).toHaveLength(1);
+    expect(issues.length).toBeLessThanOrEqual(64);
+  });
+});
+
 describe('field evidence and identity', () => {
   it('distinguishes absent, null, zero, false, empty, invalid and unsupported', () => {
     const result = inspect({

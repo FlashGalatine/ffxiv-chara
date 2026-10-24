@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { readChara } from '../src/index.js';
 
@@ -8,6 +9,59 @@ function rejects(input: unknown, code: string, options?: unknown) {
     expect.objectContaining({ name: 'CharaInputError', code }),
   );
 }
+
+describe('binary input from another realm', () => {
+  const text = '{"Race":"Hyur","Hair":3}';
+  const bytes = [...Buffer.from(text)].join(',');
+  it('reads a Uint8Array created in another realm', () => {
+    const foreign = runInNewContext(`new Uint8Array([${bytes}])`) as Uint8Array;
+    expect(foreign instanceof Uint8Array).toBe(false); // the point of the test
+    expect(readChara(foreign).fields).toMatchObject({ Race: 'Hyur', Hair: 3 });
+  });
+  it('reads only the window of a larger foreign buffer', () => {
+    const foreign = runInNewContext(
+      `const all = new Uint8Array(64).fill(0x7a); all.set([${bytes}], 11); all.subarray(11, 11 + ${text.length})`,
+    ) as Uint8Array;
+    expect(foreign.byteOffset).toBe(11);
+    expect(readChara(foreign).fields).toMatchObject({ Race: 'Hyur', Hair: 3 });
+  });
+  it('rejects a Uint8Array whose buffer was transferred away, with the fixed error', () => {
+    const view = new Uint8Array(Buffer.from(text));
+    structuredClone(view.buffer, { transfer: [view.buffer] });
+    expect(view.byteLength).toBe(0); // detached
+    rejects(view, 'INVALID_INPUT');
+  });
+  it('reads the real bytes when own properties shadow the view', () => {
+    const view = new Uint8Array(Buffer.from(text));
+    for (const key of ['buffer', 'byteOffset', 'byteLength'])
+      Object.defineProperty(view, key, {
+        value: key === 'buffer' ? new ArrayBuffer(1) : 1e9,
+      });
+    expect(readChara(view).fields).toMatchObject({ Race: 'Hyur', Hair: 3 });
+  });
+  it('still reads a Buffer and an ordinary Uint8Array', () => {
+    expect(readChara(Buffer.from(text)).fields).toMatchObject({ Hair: 3 });
+    expect(readChara(new Uint8Array(Buffer.from(text))).fields).toMatchObject({
+      Hair: 3,
+    });
+  });
+  it.each([
+    ['an ArrayBuffer', () => new ArrayBuffer(8)],
+    ['a Uint8ClampedArray', () => new Uint8ClampedArray(8)],
+    ['an Int8Array', () => new Int8Array(8)],
+    ['a DataView', () => new DataView(new ArrayBuffer(8))],
+    [
+      'an object that only inherits Uint8Array.prototype',
+      () => Object.create(Uint8Array.prototype),
+    ],
+    [
+      'an object that fakes the Uint8Array tag',
+      () => ({ [Symbol.toStringTag]: 'Uint8Array', byteLength: 8 }),
+    ],
+  ])('rejects %s with the fixed error', (_name, make) => {
+    rejects(make(), 'INVALID_INPUT');
+  });
+});
 
 describe('bounded character reader', () => {
   it.each([

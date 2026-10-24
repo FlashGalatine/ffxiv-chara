@@ -12,7 +12,7 @@
 
 **Spec:** [Consumer migration brief](../../../migration.md), [library API](../../api.md), [appearance semantics](../../api.md#appearance-interpretation-xivcharakitappearance), and the compatibility decisions below.
 
-**Execution root:** `C:\dev\XIVProjects\xivdyetools`. All task paths refer to that repository unless explicitly prefixed `XIVCharaKit:`. This plan is stored in the library repository for handoff; its Markdown reference links resolve relative to this document. An executor can read it here while working in the target repository; copying files is not required.
+**Execution root:** a local checkout of `FlashGalatine/xivdyetools`. All task paths refer to that repository unless explicitly prefixed `XIVCharaKit:`. This plan is stored in the library repository for handoff; its Markdown reference links resolve relative to this document. An executor can read it here while working in the target repository; copying files is not required.
 
 ## Baseline and scope
 
@@ -27,13 +27,13 @@ Reviewed local sources on **2026-10-22**. The initial draft used target `d50927c
 | Discord worker | `5.8.15` | Shared attachment guards and command handlers |
 | API worker | `0.20.1` | `/v1/chara/resolve`, icon proxy, regional names, acquisition and twin selection |
 
-The integration target is **exactly `xivcharakit@0.1.0-beta.3` once published and verified**, not a floating `next` tag. Review its eventual registry artifact against its own CI release manifest before installation. The historical beta.2 integrity is `sha512-i0Kno7HGUeBs9h9pPVCVxanofG2tXb/O125/bB7tCjqj4qrYmXhmoF0sRhcRbBrg60veMCoUL7Tg0iUpUsOauw==`; it cannot substitute for beta.3 verification.
+The integration target is **exactly `xivcharakit@0.1.0-beta.3` once published and verified**, not a floating `next` tag. Review its eventual registry artifact against its own CI release manifest before installation. The historical beta.2 integrity is `sha512-i0Kno7HGUeBs9h9pPVCVxanofG2tXb/O125/bB7tCjqj4qrYmXhmoF0sRhcRbBrg60veMCoUL7Tg0iUpUsOauw==`; it cannot substitute for beta.3 verification. Beta.3 ignores the lip-color bit of `Mouth` (audit finding F096); beta.4, prepared and not published, reads it and reports the lip of the committed real exports as inactive (`lipDisabled`). Whether the target moves to beta.4 once it is published, verified and aged is the maintainer's decision.
 
 Beta.2 is a historical comparison baseline, not a promise of complete host parity. The host accepts the legacy `Helion` tribe alias, while published beta.2 lists `Helions` without that alias. The beta.3 candidate fixes this gap with inspection and actual-palette regressions, following the 2026-10-22 producer-source refresh. Publish and verify beta.3 before consumer adoption; preparing this candidate does not change the published beta.2 artifact. Any additional blocking gap found during comparison requires its own reviewed library change and exact version pin.
 
 ## Review findings addressed by this revision
 
-Review basis: the local `2026-10-22-chara-integration-plan-security` audit in the target repository's `.claude/worktrees/chara-integration-plan-review/docs/audits/` directory. Its original snapshot and findings remain historical evidence. The following requirements address the findings in the plan; they do not mark the unimplemented fixes or acceptance gates complete.
+Review basis: the `2026-10-22-chara-integration-plan-security` audit of this plan, which the maintainer keeps locally and which is not part of either repository. Its original snapshot and findings remain historical evidence. The following requirements address the findings in the plan; they do not mark the unimplemented fixes or acceptance gates complete.
 
 | Finding | Required plan change | Owner / acceptance |
 | --- | --- | --- |
@@ -75,7 +75,7 @@ These local save/backup exceptions preserve existing behavior and the web Privac
 ## Review focus
 
 1. Partial files and malformed fields must not fabricate a complete appearance, an undyed channel, or an empty equipment slot. Task 3 owns these assertions.
-2. Inactive lip alpha, historical eye correction, unavailable shader data and unknown activation must retain distinct meanings. Tasks 1–3 pin the evidence and matching policy; Tasks 5–6 pin previews, warnings and eligible matches.
+2. Inactive lip alpha, the eye-pair correction, unavailable shader data and unknown activation must retain distinct meanings. Tasks 1–3 pin the evidence and matching policy; Tasks 5–6 pin previews, warnings and eligible matches.
 3. A clear, refused replacement, delayed read or delayed worker result must preserve the intended session and lookup consent. Tasks 4–5 own these assertions.
 4. New inspection metadata and existing local-save labels must not escape through logs, bot titles, error text, telemetry, glamour lists or resolver payloads. Task 5 includes shared collection lifecycle and malformed-import errors in both logging modes; Tasks 3 and 6 own projection/bot assertions.
 5. A shared core dependency must not load duplicate palettes, trigger network activity on import, or break installed ESM/Node/Workers consumers. Tasks 2 and 7 own these assertions.
@@ -106,7 +106,7 @@ Use the existing host provider first. This avoids shipping a second palette corp
 | Explicitly disabled highlight or face-paint control | Old parser treats missing controls permissively | Preserve explicit `active: false` and inactive interpretation; no automatic matching. This differs from unknown activation. |
 | Missing/null/invalid highlight or face-paint control with a resolved color | Old host can treat missing controls permissively | Keep library `active: null`, `interpretation`, `displayHex` and `reason` intact. Show a localized activity-unknown preview/warning; set host `matchHex: null` so automatic matching, matched-color saves and appearance exports exclude it. Do not fabricate unresolved color or inactive status. |
 | Lip alpha zero with extended data inactive | Old resolver makes the lip inert whenever stored alpha is zero | Follow library activation: inactive stored alpha must not suppress an indexed lip. Pin this corrected behavior in both web and bot tests. |
-| Historical crossed eyes | Old resolver and library have distinct guard conditions | Use library correction only with its complete evidence and live extended data. Keep original fields out of output mutation; show the effective corrected preview. |
+| Crossed eyes (every current Brio export) | Old resolver and library have distinct guard conditions | Use library correction only with its complete evidence and live extended data. Keep original fields out of output mutation; show the effective corrected preview. |
 | Missing shader reference | Old resolver falls back to creator comparison | Remain unresolved; do not use creator color as a pretend shader reference. |
 | Embedded image under 8 KiB | Current parser ignores a populated `Base64Image` | Preserve omission, including null/empty placeholders; do not introduce a new blanket image-field rejection. The byte cap still refuses large image-bearing files. |
 | Duplicate keys, depth/node limits, unsafe numbers | Current native JSON behavior is less restrictive | Accept the library's bounded refusal, with fixed localized errors and prior-session retention. |

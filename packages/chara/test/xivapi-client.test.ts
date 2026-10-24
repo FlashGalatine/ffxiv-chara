@@ -1,9 +1,11 @@
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { EquipmentModel } from '../src/types.js';
 import {
   type CachedRows,
   createMemoryCache,
   createXivapiClient,
+  type ResolutionCache,
   type XivapiOptions,
 } from '../src/xivapi/index.js';
 
@@ -172,7 +174,7 @@ describe('portable XIVAPI requests', () => {
       iconId: null,
     });
   });
-  it('only treats a validated successful empty search or glasses row list as complete empty', async () => {
+  it('treats a validated successful empty search or glasses row list as complete empty, and an unrecognised failure as unavailable', async () => {
     expect(
       (await client(async () => json(page())).searchItems([body])).status,
     ).toBe('complete');
@@ -709,5 +711,348 @@ describe('versioned normalized row caching', () => {
     expect(await cache.get('cycle')).toBeNull();
     await cache.set('bad', record, Infinity);
     expect(await cache.get('bad')).toBeNull();
+  });
+});
+
+describe('browser-style redirects and cached row order', () => {
+  it('reports an opaque redirect as a refused redirect, as a browser returns it', async () => {
+    // fetch with redirect: 'manual' resolves to type opaqueredirect, status 0 and no body.
+    const opaque = {
+      type: 'opaqueredirect',
+      status: 0,
+      ok: false,
+      body: null,
+      headers: new Headers(),
+    } as unknown as Response;
+    const r = await client(async () => opaque).searchItems([body]);
+    expect(r.status).toBe('unavailable');
+    expect(code(r)).toEqual(['REDIRECT_REFUSED']);
+  });
+  it('still refuses a redirect whose body cannot be cancelled', async () => {
+    const odd = {
+      type: 'basic',
+      status: 302,
+      ok: false,
+      body: {},
+      headers: new Headers(),
+    } as unknown as Response;
+    const r = await client(async () => odd).searchItems([body]);
+    expect(code(r)).toEqual(['REDIRECT_REFUSED']);
+  });
+  it('treats a cached entry with a repeated row as a miss', async () => {
+    const backing = new Map<string, unknown>();
+    const store = {
+      async get(key: string) {
+        return (backing.get(key) ?? null) as CachedRows | null;
+      },
+      async set(key: string, value: CachedRows) {
+        backing.set(key, JSON.parse(JSON.stringify(value)));
+      },
+    };
+    const stainBody = () =>
+      json({
+        version: V,
+        schema: S,
+        rows: [{ row_id: 2, fields: { 'Name@lang(en)': 'Ash Grey' } }],
+      });
+    await client(async () => stainBody(), {
+      cache: store,
+      languages: ['en'],
+    }).getStains([2]);
+    for (const value of backing.values()) {
+      const entry = value as { rows: unknown[] };
+      entry.rows = [entry.rows[0], entry.rows[0]];
+    }
+    const second = vi.fn(async () => stainBody());
+    const result = await client(second, {
+      cache: store,
+      languages: ['en'],
+    }).getStains([2]);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(result.rows.map((r) => r.rowId)).toEqual([2]);
+  });
+  it('treats a cached entry whose rows are not in ascending order as a miss', async () => {
+    const stains = (ids: number[]) =>
+      json({
+        version: V,
+        schema: S,
+        rows: ids.map((id) => ({
+          row_id: id,
+          fields: { 'Name@lang(en)': `Dye ${id}` },
+        })),
+      });
+    const store = createMemoryCache();
+    const first = vi.fn(async () => stains([2, 5]));
+    await client(first, { cache: store, languages: ['en'] }).getStains([2, 5]);
+    expect(first).toHaveBeenCalledTimes(1);
+    const reordered = {
+      set: store.set,
+      async get(key: string) {
+        const value = await store.get(key);
+        value?.rows.reverse();
+        return value;
+      },
+    };
+    const second = vi.fn(async () => stains([2, 5]));
+    const result = await client(second, {
+      cache: reordered,
+      languages: ['en'],
+    }).getStains([2, 5]);
+    expect(second).toHaveBeenCalledTimes(1);
+    expect(result.rows.map((r) => r.rowId)).toEqual([2, 5]);
+  });
+});
+
+describe('values from another realm and unusable signals', () => {
+  it('reads response chunks created in another realm', async () => {
+    const payload = JSON.stringify(page([wire()]));
+    const foreign = runInNewContext(
+      `new Uint8Array([${[...Buffer.from(payload)].join(',')}])`,
+    ) as Uint8Array;
+    expect(foreign instanceof Uint8Array).toBe(false);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(foreign);
+        controller.close();
+      },
+    });
+    const r = await client(async () => new Response(stream)).searchItems([
+      body,
+    ]);
+    expect(r.status).toBe('complete');
+    expect(r.rows[0]?.rowId).toBe(42);
+  });
+  it('honours a signal that is not an AbortSignal of this realm', async () => {
+    class OtherSignal extends EventTarget {
+      aborted = false;
+    }
+    const other = new OtherSignal();
+    const fetch = vi.fn(() => new Promise<Response>(() => {}));
+    const pending = client(fetch).searchItems([body], {
+      signal: other as unknown as AbortSignal,
+    });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    other.aborted = true;
+    other.dispatchEvent(new Event('abort'));
+    expect((await pending).status).toBe('cancelled');
+  });
+  it.each([
+    ['an empty object', {}],
+    ['a string', 'x'],
+    ['a number', 1],
+    ['null', null],
+    ['an object without the listener methods', { aborted: false }],
+    [
+      'an object missing only removeEventListener',
+      { aborted: false, addEventListener() {} },
+    ],
+    [
+      'an object missing only addEventListener',
+      { aborted: false, removeEventListener() {} },
+    ],
+    [
+      'an object without a boolean aborted',
+      { addEventListener() {}, removeEventListener() {} },
+    ],
+    [
+      'an object whose aborted is not a boolean',
+      { aborted: 'no', addEventListener() {}, removeEventListener() {} },
+    ],
+    ['an AbortSignal prototype object', Object.create(AbortSignal.prototype)],
+  ])(
+    'rejects %s as a signal before any request starts',
+    async (_name, signal) => {
+      const fetch = vi.fn(async () => json(page([wire()])));
+      const c = client(fetch);
+      const options = { signal } as unknown as { signal?: AbortSignal };
+      await expect(c.searchItems([body], options)).rejects.toMatchObject({
+        code: 'INVALID_LOOKUP',
+      });
+      await expect(c.getStains([2], options)).rejects.toMatchObject({
+        code: 'INVALID_LOOKUP',
+      });
+      await expect(c.getGlasses(8, options)).rejects.toMatchObject({
+        code: 'INVALID_LOOKUP',
+      });
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+  it('rejects options whose signal getter throws, before any request', async () => {
+    const fetch = vi.fn(async () => json(page([wire()])));
+    const options = Object.defineProperty({}, 'signal', {
+      get() {
+        throw new Error('boom');
+      },
+    });
+    const c = client(fetch);
+    await expect(c.searchItems([body], options)).rejects.toMatchObject({
+      code: 'INVALID_LOOKUP',
+    });
+    await expect(c.getStains([2], options)).rejects.toMatchObject({
+      code: 'INVALID_LOOKUP',
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('does not orphan a subscriber when the signal cannot register its listener', async () => {
+    const aborts: boolean[] = [];
+    const fetch = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>(() => {
+          init?.signal?.addEventListener('abort', () => aborts.push(true));
+        }),
+    );
+    const c = client(fetch);
+    const real = new AbortController();
+    const first = c.searchItems([body], { signal: real.signal });
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const bad = {
+      aborted: false,
+      addEventListener() {
+        throw new TypeError('no listeners');
+      },
+      removeEventListener() {},
+    } as unknown as AbortSignal;
+    await expect(c.searchItems([body], { signal: bad })).rejects.toMatchObject({
+      code: 'INVALID_LOOKUP',
+    });
+    // The failed caller must not keep the shared request alive once the real caller leaves.
+    real.abort();
+    expect((await first).status).toBe('cancelled');
+    await vi.waitFor(() => expect(aborts).toEqual([true]));
+  });
+  it('settles when the signal cannot remove its listener', async () => {
+    const odd = {
+      aborted: false,
+      addEventListener() {},
+      removeEventListener() {
+        throw new TypeError('no removal');
+      },
+    } as unknown as AbortSignal;
+    const result = await Promise.race([
+      client(async () => json(page([wire()]))).searchItems([body], {
+        signal: odd,
+      }),
+      new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 500)),
+    ]);
+    expect(result).toMatchObject({ status: 'complete' });
+  });
+  it('rejects request options that are not an object', async () => {
+    const fetch = vi.fn(async () => json(page([wire()])));
+    await expect(
+      client(fetch).searchItems([body], null as never),
+    ).rejects.toMatchObject({ code: 'INVALID_LOOKUP' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe('host caches that hang', () => {
+  const stains = () =>
+    json({
+      version: V,
+      schema: S,
+      rows: [{ row_id: 2, fields: { 'Name@lang(en)': 'Ash Grey' } }],
+    });
+  const options = (cache: ResolutionCache) => ({
+    cache,
+    languages: ['en' as const],
+    timeoutMs: 20,
+  });
+  it('keeps a fully fetched result complete when the cache write never settles', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async () => stains());
+    let settled = false;
+    const pending = client(
+      fetch,
+      options({
+        get: async () => null,
+        set: () => new Promise<void>(() => {}),
+      }),
+    )
+      .getStains([2])
+      .finally(() => {
+        settled = true;
+      });
+    // The write is capped at timeoutMs (20 ms); the 30 s operation deadline must not be needed.
+    await vi.advanceTimersByTimeAsync(25);
+    expect(settled).toBe(true);
+    const result = await pending;
+    expect(result).toMatchObject({ status: 'complete', issues: [] });
+    expect(result.rows.map((r) => r.rowId)).toEqual([2]);
+  });
+  it('treats a cache read that never settles as a miss after the request timeout', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn(async () => stains());
+    const pending = client(
+      fetch,
+      options({ get: () => new Promise<null>(() => {}), set: async () => {} }),
+    ).getStains([2]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const result = await pending;
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ status: 'complete', issues: [] });
+  });
+  it('keeps a complete result complete when the operation deadline expires during the cache write', async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    // Three pages of 9.9 s each end just before the 30 s operation deadline.
+    const fetch = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          const n = ++calls;
+          setTimeout(
+            () =>
+              resolve(
+                json(page([wire(40 + n)], n < 3 ? `cursor-${n}` : undefined)),
+              ),
+            9_900,
+          );
+        }),
+    );
+    const pending = client(fetch, {
+      cache: { get: async () => null, set: () => new Promise<void>(() => {}) },
+    }).searchItems([body]);
+    await vi.advanceTimersByTimeAsync(40_000);
+    const result = await pending;
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ status: 'complete', issues: [] });
+    expect(result.rows.map((r) => r.rowId)).toEqual([41, 42, 43]);
+  });
+  it('releases scheduler slots at once when callers cancel during pending cache reads', async () => {
+    vi.useFakeTimers();
+    let gets = 0;
+    const fetch = vi.fn(async (input: RequestInfo | URL) =>
+      json({
+        version: V,
+        schema: S,
+        rows: (new URL(String(input)).searchParams.get('rows') ?? '')
+          .split(',')
+          .map((id) => ({
+            row_id: Number(id),
+            fields: { 'Name@lang(en)': `Dye ${id}` },
+          })),
+      }),
+    );
+    const c = client(fetch, {
+      languages: ['en'],
+      cache: {
+        get: () =>
+          ++gets <= 2 ? new Promise<null>(() => {}) : Promise.resolve(null),
+        set: async () => {},
+      },
+    });
+    const a = new AbortController();
+    const b = new AbortController();
+    const first = c.getStains([2], { signal: a.signal });
+    const second = c.getStains([3], { signal: b.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(gets).toBe(2); // both cache reads are pending when the callers cancel
+    a.abort();
+    b.abort();
+    expect((await first).status).toBe('cancelled');
+    expect((await second).status).toBe('cancelled');
+    const third = c.getStains([4]);
+    await vi.advanceTimersByTimeAsync(5); // far below timeoutMs: the slots were freed
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect((await third).status).toBe('complete');
   });
 });

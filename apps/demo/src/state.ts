@@ -1,9 +1,14 @@
-import type { EquipmentModel } from 'xivcharakit';
+import type { CharaInspection, EquipmentModel } from 'xivcharakit';
 import type { DyeNameResolver } from 'xivcharakit/dyes';
 import { loadIcons } from './icons.js';
 import type { DemoState, WorkerReply } from './types.js';
 
 const MAX_BYTES = 8 * 1024 * 1024;
+/** Why a file was refused for its size: Anamnesis can save an image that takes it past the limit. */
+const sizeHint = (code: string): string =>
+  code === 'FILE_TOO_LARGE' || code === 'INPUT_TOO_LARGE'
+    ? ' The demo reads files up to 8 MiB. An Anamnesis file saved with a large embedded image can be bigger; the library can read most of those when its maxBytes option is raised (up to 64 MiB).'
+    : '';
 export class DemoSession {
   readonly state: DemoState = {
     fileName: null,
@@ -13,6 +18,7 @@ export class DemoSession {
     resolution: null,
     dyeNames: null,
     error: null,
+    errorSerial: 0,
     localStatus: 'Choose a file or try a synthetic example.',
     reading: false,
     lookingUp: false,
@@ -27,6 +33,10 @@ export class DemoSession {
   private exampleController: AbortController | null = null;
   private dyeResolver: DyeNameResolver | undefined;
   constructor(private readonly changed: (kind?: 'icons') => void) {}
+  private raise(message: string): void {
+    this.state.error = message;
+    this.state.errorSerial++;
+  }
   private stopWorker(): void {
     this.worker?.terminate();
     this.worker = null;
@@ -83,7 +93,16 @@ export class DemoSession {
     this.state.reading = true;
     this.state.localStatus = 'Reading locally…';
     this.changed();
-    let committed = false;
+    this.run(file, generation);
+  }
+  /** Runs the worker for a new file, or resumes the colors of the inspection the page retained. */
+  private run(
+    request: File | { inspection: CharaInspection },
+    generation: number,
+    rejected?: string,
+  ): void {
+    const file = request instanceof File ? request : null;
+    let committed = file === null;
     const worker = new Worker(new URL('./worker.ts', import.meta.url), {
       type: 'module',
     });
@@ -94,9 +113,17 @@ export class DemoSession {
       if (committed) {
         this.state.appearanceStatus = 'unavailable';
         this.state.reading = false;
-        this.state.error = `${code}: Appearance could not be resolved. The selected file remains inspected.`;
+        // A resumed job belongs to a rejected replacement: keep that rejection in the message,
+        // and do not say that the selected file was inspected.
+        this.raise(
+          rejected === undefined
+            ? `${code}: Appearance could not be resolved. The selected file remains inspected.`
+            : `${rejected}: Could not finish local inspection. Your previous valid file is retained. ${code}: The previous file's colors could not be resolved.${sizeHint(rejected)}`,
+        );
         this.state.localStatus =
-          'File inspected locally. Color evidence unavailable.';
+          rejected === undefined
+            ? 'File inspected locally. Color evidence unavailable.'
+            : 'File rejected. Color evidence for the previous file is unavailable.';
         this.changed();
       } else this.reject(code);
     };
@@ -113,7 +140,7 @@ export class DemoSession {
       const message = event.data;
       if (message.type === 'inspection') {
         committed = true;
-        this.state.fileName = file.name.slice(0, 256);
+        this.state.fileName = file?.name.slice(0, 256) ?? null;
         this.state.inspection = message.inspection;
         this.state.appearance = null;
         this.state.appearanceStatus = 'loading';
@@ -124,17 +151,33 @@ export class DemoSession {
         this.state.appearance = message.appearance;
         this.state.appearanceStatus = 'ready';
         this.state.reading = false;
-        this.state.localStatus = 'File inspected locally.';
+        this.state.localStatus =
+          rejected === undefined
+            ? 'File inspected locally.'
+            : 'File rejected or processing incomplete.';
         this.stopWorker();
         this.changed();
       } else fail(message.code);
     };
-    worker.postMessage(file);
+    worker.postMessage(
+      request instanceof File
+        ? request
+        : { type: 'appearance', inspection: request.inspection },
+    );
   }
   private reject(code: string): void {
-    this.state.error = `${code}: Could not finish local inspection. Your previous valid file is retained.`;
+    this.raise(
+      `${code}: Could not finish local inspection. Your previous valid file is retained.${sizeHint(code)}`,
+    );
     this.state.reading = false;
     this.state.localStatus = 'File rejected or processing incomplete.';
+    // begin() stopped the worker that was still resolving the retained file's colors.
+    if (this.state.inspection && this.state.appearanceStatus === 'loading') {
+      this.state.reading = true;
+      this.state.localStatus =
+        'File rejected. Loading color evidence for the previous file…';
+      this.run({ inspection: this.state.inspection }, this.generation, code);
+    }
     this.changed();
   }
   async example(producer: 'anamnesis' | 'ktisis' | 'brio'): Promise<void> {

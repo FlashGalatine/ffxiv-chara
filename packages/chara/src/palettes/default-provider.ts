@@ -33,13 +33,17 @@ export const PALETTE_METADATA: PaletteMetadata = metadata;
 const own = (record: object, key: PropertyKey) => Object.hasOwn(record, key);
 
 function colors(value: unknown, length: number): readonly string[] {
-  if (
-    !Array.isArray(value) ||
-    value.length !== length ||
-    value.some((hex) => typeof hex !== 'string' || !/^#[0-9A-F]{6}$/.test(hex))
-  )
+  if (!Array.isArray(value) || value.length !== length)
     throw new PaletteDataError();
-  return Object.freeze(value.slice() as string[]);
+  // Every index is read: Array.prototype.some and every skip the holes of a sparse array.
+  const result: string[] = [];
+  for (let i = 0; i < length; i++) {
+    const hex: unknown = value[i];
+    if (typeof hex !== 'string' || !/^#[0-9A-F]{6}$/.test(hex))
+      throw new PaletteDataError();
+    result.push(hex);
+  }
+  return Object.freeze(result);
 }
 function validate(data: unknown, key: DatasetKey): PaletteDataset {
   if (!isRecord(data)) throw new PaletteDataError();

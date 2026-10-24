@@ -182,6 +182,39 @@ describe('equipment candidates', () => {
       r.items.OffHand?.candidates.map((c) => [c.itemId, c.viaMainHand]),
     ).toEqual([[401, false]]);
   });
+  it('does not pair an all-zero off-hand with a main hand whose ModelSub is also zero', async () => {
+    const paired = fixture.rows[4];
+    if (!paired) throw new Error('Fixture missing');
+    // ModelSub 0 is XIVAPI's "no sub-model" value; off-hand key "0" means "nothing equipped".
+    const r = await resolver(source([{ ...paired, modelSub: '0' }])).resolve({
+      models: [main, { slot: 'OffHand', set: 0, base: 0, variant: 0 }],
+    });
+    expect(r.items.MainHand?.candidates.map((c) => c.itemId)).toEqual([301]);
+    expect(r.items.OffHand).toMatchObject({
+      modelKey: '0',
+      status: 'notFound',
+      candidates: [],
+    });
+    expect(r.issues.map((issue) => issue.code)).not.toContain(
+      'INCOMPLETE_OFFHAND_CONTEXT',
+    );
+  });
+  it('does not flag a missing main-hand ModelSub for an all-zero off-hand', async () => {
+    const paired = fixture.rows[4];
+    if (!paired) throw new Error('Fixture missing');
+    const r = await resolver(source([{ ...paired, modelSub: null }])).resolve({
+      models: [main, { slot: 'OffHand', set: 0, base: 0, variant: 0 }],
+    });
+    expect(r.items.MainHand?.candidates.map((c) => c.itemId)).toEqual([301]);
+    expect(r.items.OffHand).toMatchObject({
+      modelKey: '0',
+      status: 'notFound',
+      candidates: [],
+    });
+    expect(r.issues.map((issue) => issue.code)).not.toContain(
+      'INCOMPLETE_OFFHAND_CONTEXT',
+    );
+  });
   it('does not reuse a cached off-hand selection across different main-hand contexts', async () => {
     const c = resolver(source(), { cache: createMemoryCache() });
     const a = await c.resolve({ models: [main, off] });
@@ -446,11 +479,85 @@ describe('incomplete evidence and facewear', () => {
     expect(r.upstream.items).toEqual({ version: null, schema: null });
   });
   it('distinguishes absent facewear from a successfully unmatched requested ID including zero', async () => {
-    const r = resolver(async () => json({ version: V, schema: S, rows: [] }));
+    const r = resolver(async (input) =>
+      json(
+        {
+          code: 404,
+          message: `not found: the Excel row Glasses/${new URL(String(input)).searchParams.get('rows')}:0 could not be found`,
+        },
+        404,
+      ),
+    );
     expect((await r.resolve({ models: [] })).facewear).toBeNull();
     expect(
       (await r.resolve({ models: [], glassesId: 0 })).facewear,
     ).toMatchObject({ id: 0, status: 'notFound', candidates: [] });
+  });
+  it('stops waiting on a hung host cache after its first timeout, across both components', async () => {
+    vi.useFakeTimers();
+    const hung = {
+      get: () => new Promise<null>(() => {}),
+      set: () => new Promise<void>(() => {}),
+    };
+    const pending = resolver(
+      async (input) =>
+        new URL(String(input)).pathname.endsWith('/sheet/Glasses')
+          ? json({
+              version: V,
+              schema: S,
+              rows: [
+                {
+                  row_id: 8,
+                  fields: {
+                    'Name@lang(en)': 'Synthetic Glasses',
+                    Icon: { id: 9 },
+                  },
+                },
+              ],
+            })
+          : response([]),
+      { cache: hung },
+    ).resolve({ models: [body], glassesId: 8 });
+    await vi.advanceTimersByTimeAsync(35_000);
+    const r = await pending;
+    expect(r.items.Body?.status).toBe('notFound');
+    expect(r.facewear).toMatchObject({ id: 8, status: 'matched' });
+  });
+  it('reads glassesId once, so a getter cannot change it after validation', async () => {
+    let reads = 0;
+    const input = {
+      models: [],
+      get glassesId() {
+        return ++reads === 1 ? 8 : 70000;
+      },
+    } as unknown as EquipmentResolveInput;
+    const rows: string[] = [];
+    const r = await resolver(async (url) => {
+      rows.push(new URL(String(url)).searchParams.get('rows') ?? '');
+      return json({
+        version: V,
+        schema: S,
+        rows: [{ row_id: 8, fields: { 'Name@lang(en)': 'Synthetic Glasses' } }],
+      });
+    }).resolve(input);
+    expect(reads).toBe(1);
+    expect(rows).toEqual(['8']);
+    expect(r.facewear).toMatchObject({ id: 8, status: 'matched' });
+  });
+  it('accepts and honours a signal that is not an AbortSignal of this realm', async () => {
+    class OtherSignal extends EventTarget {
+      aborted = false;
+    }
+    const other = new OtherSignal();
+    const fetch = vi.fn(() => new Promise<Response>(() => {}));
+    const pending = resolver(fetch).resolve(
+      { models: [body] },
+      { signal: other as unknown as AbortSignal },
+    );
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    other.aborted = true;
+    other.dispatchEvent(new Event('abort'));
+    expect((await pending).items.Body?.status).toBe('cancelled');
   });
   it('preserves caller cancellation for both item and facewear results', async () => {
     const abort = new AbortController();
@@ -522,5 +629,40 @@ describe('resolver admission and privacy', () => {
     expect(result.items.Body?.model).toEqual(body);
     expect(url).not.toContain('PRIVATE');
     expect(url).not.toContain('DyeId');
+  });
+});
+
+describe('facewear rows that XIVAPI reports as missing', () => {
+  it('reports a Glasses row the API says does not exist as not found, like the live API', async () => {
+    const urls: string[] = [];
+    const r = await resolver(async (input) => {
+      const url = new URL(String(input));
+      urls.push(url.pathname);
+      return json(
+        {
+          code: 404,
+          message: `not found: the Excel row Glasses/${url.searchParams.get('rows')}:0 could not be found`,
+        },
+        404,
+      );
+    }).resolve({ models: [], glassesId: 60000 });
+    expect(r.facewear).toMatchObject({
+      id: 60000,
+      status: 'notFound',
+      candidates: [],
+    });
+    expect(urls).toEqual(['/api/sheet/Glasses']);
+  });
+  it('does not take a missing sheet for a missing row', async () => {
+    const r = await resolver(async () =>
+      json(
+        {
+          code: 404,
+          message: 'not found: the Excel sheet "Glasses" could not be found',
+        },
+        404,
+      ),
+    ).resolve({ models: [], glassesId: 8 });
+    expect(r.facewear?.status).toBe('unavailable');
   });
 });

@@ -7,6 +7,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from '@playwright/test';
 import { build } from 'esbuild';
+import { runTool } from './run-tool.js';
 
 const expected = {
   entries: 5,
@@ -44,7 +45,7 @@ export async function runRuntimeChecks(consumer: string): Promise<void> {
       files: ['smoke.ts', 'browser.ts', 'worker.ts', 'cloudflare.ts'],
     }),
   );
-  execFileSync(
+  runTool(
     process.execPath,
     [
       fileURLToPath(
@@ -53,7 +54,7 @@ export async function runRuntimeChecks(consumer: string): Promise<void> {
       '-p',
       'runtime-tsconfig.json',
     ],
-    { cwd: consumer, stdio: 'pipe', timeout: 15000 },
+    { cwd: consumer, timeout: 15000 },
   );
   await writeFile(
     resolve(consumer, 'node-runtime.ts'),
@@ -201,6 +202,6 @@ if (isMainThread) {
     await harness.close();
   }
   console.log(
-    'Installed tarball: shared smoke passed in Node, Node Worker, Chromium, module Web Worker and local Wrangler/workerd; 5 exports, zero native API requests.',
+    'Installed tarball: shared smoke passed in Node, Node Worker, Chromium, module Web Worker and local Wrangler/workerd; 5 exports, zero native API requests (one probe per runtime, to a closed loopback port).',
   );
 }

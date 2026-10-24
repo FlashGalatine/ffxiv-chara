@@ -1,6 +1,7 @@
 import { isRecord } from '../field-spec.js';
 import { IssueCollector } from '../issues.js';
 import { readBoundedJson } from '../read.js';
+import { asBytes } from '../realm.js';
 import type { EquipmentModel } from '../types.js';
 import { admittedJson } from './cache.js';
 import {
@@ -13,6 +14,7 @@ import {
   type LookupSelection,
   lookupsFrom,
   type SlotLookup,
+  signalFrom,
   stainsFrom,
   XivapiInputError,
 } from './query.js';
@@ -34,6 +36,15 @@ import type {
   XivapiClient,
   XivapiOptions,
 } from './types.js';
+
+/**
+ * The two forms of Retry-After that are waited for: delay-seconds (with an optional fraction) and an
+ * HTTP date in the IMF-fixdate form. Date.parse accepts many more strings and reads them differently
+ * in different engines ("-1" and "+1" are 1 January 2001 in V8), so everything else is refused.
+ */
+const DELAY_SECONDS = /^\d+(?:\.\d+)?$/;
+const IMF_FIXDATE =
+  /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 
 class Failure extends Error {
   constructor(readonly code: string) {
@@ -58,6 +69,36 @@ function reason(signal: AbortSignal): Failure {
   return signal.reason instanceof Failure
     ? signal.reason
     : new Failure('CANCELLED');
+}
+/**
+ * The row ID that a 404 from a row-list request names as missing, or undefined when the body is
+ * anything else (a missing sheet, another sheet's row, an unknown shape). The message is matched,
+ * never quoted or returned, and an oversized body is not trusted.
+ */
+function missingRowIn(body: Uint8Array, sheet: string): number | undefined {
+  if (body.byteLength > 4096) return undefined;
+  let data: unknown;
+  try {
+    data = readBoundedJson(body);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(data) || data.code !== 404 || typeof data.message !== 'string')
+    return undefined;
+  const match = new RegExp(
+    `^not found: the Excel row ${sheet}/(0|[1-9]\\d{0,4}):0 could not be found$`,
+  ).exec(data.message.length <= 256 ? data.message : '');
+  const id = match ? Number(match[1]) : Number.NaN;
+  return Number.isInteger(id) && id <= 65535 ? id : undefined;
+}
+function joined(chunks: Uint8Array[], bytes: number): Uint8Array {
+  const buffer = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return buffer;
 }
 /** Race even uncooperative host promises, and always remove listeners. */
 function interruptible<T>(
@@ -84,6 +125,24 @@ function interruptible<T>(
     );
   });
 }
+/**
+ * A host cache call gets the per-request timeout on top of the operation's own signal. A call
+ * that hangs is a miss or a failed write, never a failed lookup.
+ */
+function cacheCall<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  ms: number,
+): Promise<T> {
+  const local = new AbortController();
+  const abort = () => local.abort(reason(signal));
+  signal.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(() => local.abort(new Failure('CACHE_TIMEOUT')), ms);
+  return interruptible(promise, local.signal).finally(() => {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+  });
+}
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -98,6 +157,8 @@ async function delay(ms: number, signal: AbortSignal): Promise<void> {
   }
 }
 interface Budget {
+  /** A host cache call timed out: skip further cache calls in this operation. */
+  cacheDown: boolean;
   requests: number;
   bytes: number;
   rows: number;
@@ -127,18 +188,63 @@ interface Transport extends XivapiClient {
 }
 const newBudget = (signal: AbortSignal): Budget => ({
   signal,
+  cacheDown: false,
   requests: 0,
   bytes: 0,
   rows: 0,
 });
 
+const OPTION_KEYS = [
+  'fetch',
+  'baseUrl',
+  'version',
+  'schema',
+  'languages',
+  'maxPages',
+  'timeoutMs',
+  'cache',
+] as const;
+
 /** Internal shared scheduler for both the low-level client and whole resolutions. */
-export function createTransport(options: XivapiOptions = {}): Transport {
+export function createTransport(given: XivapiOptions = {}): Transport {
   const invalid = (): never => {
     throw new XivapiInputError('INVALID_OPTIONS');
   };
-  if (typeof options !== 'object' || options === null || Array.isArray(options))
+  if (typeof given !== 'object' || given === null || Array.isArray(given))
     return invalid();
+  // Each option is read once, and a getter that throws makes the options invalid, as it does for
+  // createDyeNameResolver. The same goes for what an option holds: the languages are copied by index
+  // after a check of their length (a getter that throws is caught here, at creation; a hole becomes
+  // undefined and fails the language check below) and the cache's two methods are read once and called
+  // on the cache, which may rely on this.
+  const options: XivapiOptions = {};
+  try {
+    for (const key of OPTION_KEYS) {
+      const value = given[key];
+      if (value !== undefined) Object.assign(options, { [key]: value });
+    }
+    if (Array.isArray(options.languages)) {
+      const length = options.languages.length;
+      if (!Number.isInteger(length) || length < 1 || length > 4)
+        return invalid();
+      const copy: unknown[] = [];
+      for (let i = 0; i < length; i++) copy.push(options.languages[i]);
+      options.languages = copy as Language[];
+    }
+    if (typeof options.cache === 'object' && options.cache !== null) {
+      const target = options.cache;
+      const get = target.get;
+      const set = target.set;
+      if (typeof get !== 'function' || typeof set !== 'function')
+        return invalid();
+      options.cache = {
+        get: (key) => get.call(target, key),
+        set: (key, value, ttlMs) => set.call(target, key, value, ttlMs),
+      };
+    }
+  } catch {
+    return invalid();
+  }
   let base: URL;
   try {
     base = new URL(options.baseUrl ?? 'https://v2.xivapi.com/api');
@@ -203,7 +309,8 @@ export function createTransport(options: XivapiOptions = {}): Transport {
   async function request(
     url: URL,
     budget: Budget,
-  ): Promise<{ status: number; data: unknown }> {
+    rowSheet?: string,
+  ): Promise<{ status: number; data: unknown; missingRow?: number }> {
     for (let attempt = 0; attempt < 2; attempt++) {
       if (budget.signal.aborted) throw reason(budget.signal);
       if (budget.bytes > 10 * 1024 * 1024) throw new Failure('RESPONSE_LIMIT');
@@ -233,6 +340,18 @@ export function createTransport(options: XivapiOptions = {}): Transport {
           ),
           control.signal,
         );
+        // A browser answers redirect: 'manual' with an opaque redirect that has no body.
+        if (
+          response.type === 'opaqueredirect' ||
+          (response.status >= 300 && response.status < 400)
+        ) {
+          try {
+            void response.body?.cancel().catch(() => {});
+          } catch {
+            // the body is not needed
+          }
+          throw new Failure('REDIRECT_REFUSED');
+        }
         if (!response.body || typeof response.body.getReader !== 'function')
           throw new Failure('BODY_UNAVAILABLE');
         reader = response.body.getReader();
@@ -244,39 +363,44 @@ export function createTransport(options: XivapiOptions = {}): Transport {
             consumed = true;
             break;
           }
-          if (!(chunk.value instanceof Uint8Array))
-            throw new Failure('BODY_UNAVAILABLE');
-          bytes += chunk.value.byteLength;
-          budget.bytes += chunk.value.byteLength;
+          const view = asBytes(chunk.value);
+          if (!view) throw new Failure('BODY_UNAVAILABLE');
+          bytes += view.byteLength;
+          budget.bytes += view.byteLength;
           if (bytes > 2 * 1024 * 1024 || budget.bytes > 10 * 1024 * 1024)
             throw new Failure('RESPONSE_LIMIT');
-          if (response.ok) chunks.push(chunk.value);
+          if (
+            response.ok ||
+            (rowSheet !== undefined && response.status === 404)
+          )
+            chunks.push(view);
         }
-        if (
-          response.type === 'opaqueredirect' ||
-          (response.status >= 300 && response.status < 400)
-        )
-          throw new Failure('REDIRECT_REFUSED');
         if (response.status === 429 || response.status === 503) {
           if (attempt !== 0) throw new Failure('UPSTREAM_UNAVAILABLE');
           const raw = response.headers.get('Retry-After');
           retry =
             raw === null
               ? 250
-              : /^\d+(\.\d+)?$/.test(raw)
+              : DELAY_SECONDS.test(raw)
                 ? Number(raw) * 1000
-                : Date.parse(raw) - Date.now();
+                : IMF_FIXDATE.test(raw)
+                  ? Date.parse(raw) - Date.now()
+                  : Number.NaN;
           if (!Number.isFinite(retry) || retry > 2000)
             throw new Failure('RETRY_LIMIT');
           retry = Math.max(0, retry);
-        } else if (!response.ok) throw new Failure('UPSTREAM_UNAVAILABLE');
-        else {
-          const buffer = new Uint8Array(bytes);
-          let offset = 0;
-          for (const chunk of chunks) {
-            buffer.set(chunk, offset);
-            offset += chunk.byteLength;
-          }
+        } else if (!response.ok) {
+          // A row list that names a row the sheet lacks is answered with 404 for the whole
+          // request, so the one missing row is learned from the message and dropped by the caller.
+          const missingRow =
+            rowSheet !== undefined && response.status === 404
+              ? missingRowIn(joined(chunks, bytes), rowSheet)
+              : undefined;
+          if (missingRow === undefined)
+            throw new Failure('UPSTREAM_UNAVAILABLE');
+          return { status: 404, data: null, missingRow };
+        } else {
+          const buffer = joined(chunks, bytes);
           let data: unknown;
           try {
             data = readBoundedJson(buffer);
@@ -359,9 +483,13 @@ export function createTransport(options: XivapiOptions = {}): Transport {
           : schema;
       const key =
         pin && canonicalSchema(schemaPin) ? keyFor(pin, schemaPin) : null;
-      if (cache && key) {
+      if (cache && key && !budget.cacheDown) {
         try {
-          const hit: unknown = await interruptible(cache.get(key), signal);
+          const hit: unknown = await cacheCall(
+            cache.get(key),
+            signal,
+            timeoutMs,
+          );
           const text = admittedJson(hit);
           const data: unknown = text === null ? null : JSON.parse(text);
           if (
@@ -384,7 +512,9 @@ export function createTransport(options: XivapiOptions = {}): Transport {
             }
             if (
               normalized.length === data.rows.length &&
-              new Set(normalized.map((r) => r.rowId)).size === normalized.length
+              normalized.every(
+                (r, i) => i === 0 || (normalized[i - 1]?.rowId ?? 0) < r.rowId,
+              )
             ) {
               budget.rows += normalized.length;
               if (budget.rows > 5000) throw new Failure('ROW_LIMIT');
@@ -397,13 +527,22 @@ export function createTransport(options: XivapiOptions = {}): Transport {
               };
             }
           }
-        } catch {
+        } catch (error) {
           if (signal.aborted) throw reason(signal);
+          if (error instanceof Failure && error.code === 'CACHE_TIMEOUT')
+            budget.cacheDown = true;
         }
       }
       let cursor: string | undefined;
       const cursors = new Set<string>();
-      for (let page = 0; page < maxPages; page++) {
+      // Rows still asked for: a row the API reports as missing is dropped and the rest retried.
+      const wanted: number[] = stains
+        ? [...selection.stains]
+        : items
+          ? []
+          : [selection as number];
+      const sheet = stains ? 'Stain' : items ? undefined : 'Glasses';
+      const urlFor = () => {
         const url = new URL(
           stains ? 'sheet/Stain' : items ? 'search' : 'sheet/Glasses',
           base,
@@ -424,13 +563,28 @@ export function createTransport(options: XivapiOptions = {}): Transport {
                       query: buildQuery(selection as readonly SlotLookup[]),
                     }),
               }
-            : {
-                rows: isStainLookup(selection)
-                  ? selection.stains.join(',')
-                  : String(selection),
-              }),
+            : { rows: wanted.join(',') }),
         }).toString();
-        const response = await request(url, budget);
+        return url;
+      };
+      for (let page = 0; page < maxPages; page++) {
+        // A 404 names no version: with the alias unresolved a later 200 could describe another one.
+        const rowSheet = pin !== null ? sheet : undefined;
+        let response = await request(urlFor(), budget, rowSheet);
+        while (response.missingRow !== undefined) {
+          const at = wanted.indexOf(response.missingRow);
+          if (at < 0) throw new Failure('UPSTREAM_UNAVAILABLE');
+          wanted.splice(at, 1);
+          if (!wanted.length) break;
+          response = await request(urlFor(), budget, rowSheet);
+        }
+        if (response.missingRow !== undefined) {
+          // Every requested row is missing. The answer names no version or schema, so only a
+          // request that was already pinned can say which it applies to.
+          upstreamVersion = canonicalVersion(pin) ? pin : null;
+          upstreamSchema = canonicalSchema(schemaPin) ? schemaPin : null;
+          break;
+        }
         const data = response.data;
         if (
           !isRecord(data) ||
@@ -453,7 +607,11 @@ export function createTransport(options: XivapiOptions = {}): Transport {
           const row = stains
             ? normalizeStainRow(raw, languages)
             : normalizeRow(raw, languages, items);
-          if (!row || !associated(row, selection)) {
+          if (
+            !row ||
+            !associated(row, selection) ||
+            (!items && !wanted.includes(row.rowId))
+          ) {
             complete = false;
             diagnostics.add('INVALID_ROW', [], 'An upstream row was rejected.');
             continue;
@@ -486,6 +644,7 @@ export function createTransport(options: XivapiOptions = {}): Transport {
       if (
         complete &&
         cache &&
+        !budget.cacheDown &&
         canonicalVersion(upstreamVersion) &&
         canonicalSchema(upstreamSchema)
       ) {
@@ -498,19 +657,24 @@ export function createTransport(options: XivapiOptions = {}): Transport {
           complete: true,
           rows: resultRows,
         };
+        // The result is complete before this write starts, so the write is best effort: a host
+        // cache that rejects, hangs or outlives the deadline must not lower the status.
         try {
           const text = admittedJson(value);
           if (text !== null)
-            await interruptible(
+            await cacheCall(
               cache.set(
                 namespace,
                 JSON.parse(text) as CachedRows,
                 resultRows.length ? 7 * 86400_000 : 600_000,
               ),
               signal,
+              timeoutMs,
             );
-        } catch {
-          if (signal.aborted) throw reason(signal);
+        } catch (error) {
+          // ignored on purpose, but a timeout stops further cache calls in this operation
+          if (error instanceof Failure && error.code === 'CACHE_TIMEOUT')
+            budget.cacheDown = true;
         }
       }
       if (upstreamVersion && upstreamSchema && complete) {
@@ -621,23 +785,39 @@ export function createTransport(options: XivapiOptions = {}): Transport {
     }
     const shared = job;
     shared.subscribers++;
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       let done = false;
       const finish = (result: unknown) => {
         if (done) return;
         done = true;
-        signal?.removeEventListener('abort', abort);
+        // Account first: a host signal whose methods throw must not skip the bookkeeping.
         if (--shared.subscribers === 0)
           shared.controller.abort(new Failure('CANCELLED'));
+        try {
+          signal?.removeEventListener('abort', abort);
+        } catch {
+          // a host signal; nothing more to release
+        }
         resolve(JSON.parse(JSON.stringify(result)) as T);
       };
       const abort = () => finish(failure('CANCELLED', true));
-      signal?.addEventListener('abort', abort, { once: true });
+      try {
+        signal?.addEventListener('abort', abort, { once: true });
+      } catch {
+        // The signal cannot cancel this call, so it cannot be used: release the subscriber so the
+        // shared request does not outlive its real callers.
+        done = true;
+        if (--shared.subscribers === 0)
+          shared.controller.abort(new Failure('CANCELLED'));
+        reject(new XivapiInputError('INVALID_LOOKUP'));
+        return;
+      }
       void shared.promise.then(finish);
     });
   }
   return {
     async getStains(ids, requestOptions = {}) {
+      const signal = signalFrom(requestOptions);
       const stains = stainsFrom(ids);
       if (!stains.length)
         return {
@@ -665,10 +845,11 @@ export function createTransport(options: XivapiOptions = {}): Transport {
         JSON.stringify(['stains', stains]),
         (signal) => lookup({ stains }, newBudget(signal)),
         failure,
-        requestOptions.signal,
+        signal,
       )) as LookupResult<StainRow>;
     },
     async searchItems(models, requestOptions = {}) {
+      const signal = signalFrom(requestOptions);
       const selection = lookupsFrom(models);
       if (!selection.length)
         return {
@@ -682,10 +863,11 @@ export function createTransport(options: XivapiOptions = {}): Transport {
         JSON.stringify(['items', selection]),
         (signal) => lookup(selection, newBudget(signal)),
         failureResult,
-        requestOptions.signal,
+        signal,
       )) as LookupResult<ItemRow>;
     },
     async getGlasses(id, requestOptions = {}) {
+      const signal = signalFrom(requestOptions);
       if (
         typeof id !== 'number' ||
         !Number.isInteger(id) ||
@@ -697,7 +879,7 @@ export function createTransport(options: XivapiOptions = {}): Transport {
         JSON.stringify(['glasses', id]),
         (signal) => lookup(id, newBudget(signal)),
         failureResult,
-        requestOptions.signal,
+        signal,
       )) as LookupResult<GlassesRow>;
     },
     async resolveRows(models, glassesId, signal) {

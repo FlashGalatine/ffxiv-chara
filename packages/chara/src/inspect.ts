@@ -110,7 +110,9 @@ class Inspector {
     const value = decode(raw);
     if (value !== undefined) return { state: 'valid', raw, value };
     const state =
-      unsupported && (typeof raw === 'string' || isUint(raw))
+      // These fields are bytes in the producers' files: a string or 0-255 that is not a known
+      // value is unsupported, anything wider or of another type cannot be a producer value.
+      unsupported && (typeof raw === 'string' || isUint(raw, 255))
         ? 'unsupported'
         : 'invalid';
     this.issues.add(
@@ -213,8 +215,14 @@ class Inspector {
 export function inspectChara(document: CharaDocument): CharaInspection {
   const fields = document.fields;
   const reader = new Inspector(fields);
-  for (const issue of document.issues)
-    reader.issues.add(issue.code, issue.path, issue.message, issue.severity);
+  // The reader's own truncation marker is not copied in the middle of the list: it is put back
+  // as the final entry once every inspection diagnostic has been added.
+  let readerTruncated = false;
+  for (const issue of document.issues) {
+    if (issue.code === 'ISSUES_TRUNCATED') readerTruncated = true;
+    else
+      reader.issues.add(issue.code, issue.path, issue.message, issue.severity);
+  }
   const race = reader.enumeration('Race', RACES, 1, raceAliases);
   const tribe = reader.enumeration('Tribe', TRIBES, 1, tribeAliases);
   const gender = reader.enumeration(
@@ -326,6 +334,8 @@ export function inspectChara(document: CharaDocument): CharaInspection {
       return raw.GlassesId;
     return undefined;
   });
+  const modelType = reader.integer(fields, 'ModelType', 0xffffffff);
+  if (readerTruncated) reader.issues.markTruncated();
   return {
     document,
     metadata,
@@ -334,7 +344,7 @@ export function inspectChara(document: CharaDocument): CharaInspection {
       tribe,
       gender,
       age,
-      modelType: reader.integer(fields, 'ModelType', 0xffffffff),
+      modelType,
       canonicalRace,
       raceSource,
     },

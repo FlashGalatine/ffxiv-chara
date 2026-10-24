@@ -1,7 +1,7 @@
 import type { AppearanceOptions, AppearancePolicy } from './types.js';
 
 export const DEFAULT_APPEARANCE_POLICY: AppearancePolicy = Object.freeze({
-  version: '1.0.0',
+  version: '1.1.0',
   offGridDeltaE: 6,
   eyeMatchDeltaE: 1,
   historicalEyeCorrection: true,

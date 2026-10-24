@@ -3,3 +3,5 @@ packages:
   - apps/*
 onlyBuiltDependencies:
   - esbuild
+overrides:
+  miniflare>undici: 7.30.1

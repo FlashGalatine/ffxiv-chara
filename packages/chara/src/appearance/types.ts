@@ -11,7 +11,7 @@ export type AppearanceSlot =
   | 'lip'
   | 'facePaint';
 export interface AppearancePolicy {
-  readonly version: '1.0.0';
+  readonly version: '1.1.0';
   readonly offGridDeltaE: number;
   readonly eyeMatchDeltaE: number;
   readonly historicalEyeCorrection: boolean;
@@ -38,6 +38,7 @@ export type AppearanceReason =
   | 'facePaintNone'
   | 'furPattern'
   | 'noLip'
+  | 'lipDisabled'
   | 'activityUnknown';
 export interface AppearanceSlotInspection {
   slot: AppearanceSlot;
